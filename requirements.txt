@@ -1,0 +1,27 @@
+# Data pipeline
+entsoe-py
+openmeteo-requests
+requests-cache
+retry-requests
+duckdb
+python-dotenv
+
+# ML
+lightgbm
+shap
+scikit-learn
+numpy
+pandas
+holidays
+
+# API
+fastapi
+uvicorn[standard]
+
+# Dashboard
+streamlit
+plotly
+requests
+
+# Scheduler (used by pipeline.py --schedule)
+# apscheduler  # uncomment if you use APScheduler instead of Cloud Scheduler
