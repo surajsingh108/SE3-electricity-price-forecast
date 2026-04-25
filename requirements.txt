@@ -8,7 +8,6 @@ python-dotenv
 
 # ML
 lightgbm
-shap
 scikit-learn
 numpy
 pandas
