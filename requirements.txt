@@ -13,14 +13,10 @@ numpy
 pandas
 holidays
 
-# API
-fastapi
-uvicorn[standard]
-
 # Dashboard
-streamlit
+streamlit==1.35.0
 plotly
-requests
+pytz
 
-# Scheduler (used by pipeline.py --schedule)
-# apscheduler  # uncomment if you use APScheduler instead of Cloud Scheduler
+# Utilities
+google-cloud-storage

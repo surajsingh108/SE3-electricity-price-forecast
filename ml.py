@@ -72,6 +72,19 @@ LGBM_PARAMS = {
     "verbose":          -1,
 }
 
+# ── Pretrain / posttrain constants ────────────────────────────────────────────
+
+PRETRAIN_CUTOFF_DAYS  = 180   # pretrain on data older than this many days
+POSTTRAIN_WINDOW_DAYS = 90    # posttrain uses this many recent days
+POSTTRAIN_TREES       = 300   # extra trees added on top of pretrained model
+POSTTRAIN_LR          = 0.02  # lower LR to avoid overfitting recent noise
+
+POSTTRAIN_LGBM_PARAMS = {
+    **LGBM_PARAMS,
+    "n_estimators":  POSTTRAIN_TREES,
+    "learning_rate": POSTTRAIN_LR,
+}
+
 
 # ── Feature engineering ────────────────────────────────────────────────────────
 
@@ -459,6 +472,213 @@ def train(data: dict) -> dict:
     return artifacts
 
 
+# ── Pretrain ──────────────────────────────────────────────────────────────────
+
+def pretrain(data: dict, cutoff_days: int = PRETRAIN_CUTOFF_DAYS) -> dict:
+    """
+    Phase 1 — train on all data older than `cutoff_days`.
+    Run once or on a slow monthly schedule.
+
+    Produces the same artifacts dict as train(), plus 'pretrain_cutoff'.
+    Save with save_pretrained() so posttrain() can load it.
+    """
+    prices      = data["prices"]
+    weather     = data["weather"]
+    gen         = data["gen"]
+    nuclear_gen = data.get("nuclear_gen", pd.Series(dtype=float))
+    flows_df    = data.get("flows_df", pd.DataFrame())
+
+    df = prices.join(weather, how="inner").join(gen, how="left")
+    if not nuclear_gen.empty:
+        df["nuclear_gen_mw"] = nuclear_gen.reindex(df.index).ffill(limit=3)
+    if not flows_df.empty:
+        df = df.join(flows_df.reindex(df.index).ffill(limit=3))
+    for col in ["wind_gen_mw", "load_mw"]:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(
+            "Europe/Stockholm", ambiguous="infer", nonexistent="shift_forward"
+        )
+    df = df.dropna(subset=["price_eur_mwh", "temperature", "windspeed_10m"])
+
+    cutoff = df.index.max() - pd.Timedelta(days=cutoff_days)
+    df = df[df.index <= cutoff]
+    log.info("Pretrain: using data up to %s (%d rows)", cutoff.date(), len(df))
+
+    df = build_features(df)
+    df = df.dropna(axis=1, how="all")
+    df = df.dropna(subset=["price_roll_720h_mean", "price_roll_168h_mean", "price_lag_168h"])
+    feature_cols = make_feature_cols(df)
+    target_col   = "price_eur_mwh"
+
+    split_date = df.index.max() - pd.Timedelta(days=90)
+    train_df   = df[df.index <= split_date]
+
+    time_basis   = [c for c in TRIVIAL_COLS if c in df.columns]
+    neutralizers = fit_neutralizers(train_df, feature_cols, time_basis)
+    df           = apply_neutralizers(df, neutralizers, time_basis)
+    train_df     = df[df.index <= split_date]
+    feature_cols = make_feature_cols(df)
+
+    X_train = train_df[feature_cols]
+    y_train = train_df[target_col]
+
+    trivial         = [c for c in TRIVIAL_COLS if c in feature_cols]
+    linear_baseline = Ridge(alpha=1.0).fit(X_train[trivial], y_train)
+    y_train_resid   = y_train - linear_baseline.predict(X_train[trivial])
+
+    val_n           = int(len(X_train) * 0.1)
+    X_tr, X_val     = X_train.iloc[:-val_n], X_train.iloc[-val_n:]
+    y_tr_r, y_val_r = y_train_resid.iloc[:-val_n], y_train_resid.iloc[-val_n:]
+    cbs = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)]
+
+    models = {}
+    for alpha, name in [(0.05, "p05"), (0.50, "p50"), (0.95, "p95")]:
+        log.info("Pretraining LightGBM quantile=%.2f ...", alpha)
+        m = lgb.LGBMRegressor(objective="quantile", alpha=alpha, **LGBM_PARAMS)
+        m.fit(X_tr, y_tr_r, eval_set=[(X_val, y_val_r)], callbacks=cbs)
+        models[name] = m
+        log.info("  %s: best iteration %d", name, m.best_iteration_)
+
+    return {
+        "models":           models,
+        "linear_baseline":  linear_baseline,
+        "neutralizers":     neutralizers,
+        "feature_cols":     feature_cols,
+        "trivial_cols":     trivial,
+        "time_basis":       time_basis,
+        "target_col":       target_col,
+        "wind_col":         WIND_COL if WIND_COL in df.columns else "windspeed_10m",
+        "pretrain_cutoff":  str(cutoff.date()),
+        "_X_test":  df[df.index > split_date][feature_cols],
+        "_y_test":  df[df.index > split_date][target_col],
+        "_bl_test": linear_baseline.predict(
+            df[df.index > split_date][trivial]
+        ),
+    }
+
+
+# ── Posttrain ─────────────────────────────────────────────────────────────────
+
+def posttrain(
+    data: dict,
+    pretrained_artifacts: dict,
+    window_days: int = POSTTRAIN_WINDOW_DAYS,
+) -> dict:
+    """
+    Phase 2 — extend the pretrained model with recent data via init_model.
+    Run daily. Completes in 2-5 minutes.
+
+    What changes vs pretrained_artifacts:
+      - LightGBM models: extended with POSTTRAIN_TREES new trees
+      - Ridge baseline:  re-fit on the recent window (tracks regime shifts)
+      - Neutralizers:    frozen (stable, derived from long historical data)
+    """
+    prices      = data["prices"]
+    weather     = data["weather"]
+    gen         = data["gen"]
+    nuclear_gen = data.get("nuclear_gen", pd.Series(dtype=float))
+    flows_df    = data.get("flows_df", pd.DataFrame())
+
+    df = prices.join(weather, how="inner").join(gen, how="left")
+    if not nuclear_gen.empty:
+        df["nuclear_gen_mw"] = nuclear_gen.reindex(df.index).ffill(limit=3)
+    if not flows_df.empty:
+        df = df.join(flows_df.reindex(df.index).ffill(limit=3))
+    for col in ["wind_gen_mw", "load_mw"]:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(
+            "Europe/Stockholm", ambiguous="infer", nonexistent="shift_forward"
+        )
+    df = df.dropna(subset=["price_eur_mwh", "temperature", "windspeed_10m"])
+    df = build_features(df)
+    df = df.dropna(axis=1, how="all")
+    df = df.dropna(subset=["price_roll_720h_mean", "price_roll_168h_mean", "price_lag_168h"])
+
+    neutralizers = pretrained_artifacts["neutralizers"]
+    time_basis   = pretrained_artifacts["time_basis"]
+    df           = apply_neutralizers(df, neutralizers, time_basis)
+
+    feature_cols  = pretrained_artifacts["feature_cols"]
+    available     = [c for c in feature_cols if c in df.columns]
+    missing_feats = [c for c in feature_cols if c not in df.columns]
+    if missing_feats:
+        log.warning("Posttrain: %d pretrain features missing: %s",
+                    len(missing_feats), missing_feats[:5])
+
+    window_start = df.index.max() - pd.Timedelta(days=window_days)
+    recent_df    = df[df.index >= window_start].copy()
+    log.info("Posttrain window: %s — %s (%d rows)",
+             recent_df.index.min().date(), recent_df.index.max().date(), len(recent_df))
+
+    if len(recent_df) < 48:
+        raise ValueError(
+            f"Posttrain window too small ({len(recent_df)} rows). "
+            "Check that pipeline data sync ran successfully."
+        )
+
+    X_recent = recent_df[available]
+    y_recent = recent_df["price_eur_mwh"]
+
+    trivial       = pretrained_artifacts["trivial_cols"]
+    trivial_avail = [c for c in trivial if c in X_recent.columns]
+
+    linear_baseline = Ridge(alpha=1.0).fit(X_recent[trivial_avail], y_recent)
+    bl_recent       = linear_baseline.predict(X_recent[trivial_avail])
+    y_resid_recent  = y_recent - bl_recent
+
+    val_n           = max(24, int(len(X_recent) * 0.15))
+    X_tr, X_val     = X_recent.iloc[:-val_n], X_recent.iloc[-val_n:]
+    y_tr_r, y_val_r = y_resid_recent.iloc[:-val_n], y_resid_recent.iloc[-val_n:]
+    cbs = [lgb.early_stopping(30, verbose=False), lgb.log_evaluation(0)]
+
+    pretrained_models = pretrained_artifacts["models"]
+    adapted_models    = {}
+
+    for name in ["p05", "p50", "p95"]:
+        alpha = {"p05": 0.05, "p50": 0.50, "p95": 0.95}[name]
+        base_trees = pretrained_models[name].best_iteration_
+        log.info("Posttraining %s (extending %d base trees) ...", name, base_trees)
+
+        m = lgb.LGBMRegressor(
+            objective="quantile",
+            alpha=alpha,
+            **POSTTRAIN_LGBM_PARAMS,
+        )
+        m.fit(
+            X_tr, y_tr_r,
+            eval_set   = [(X_val, y_val_r)],
+            callbacks  = cbs,
+            init_model = pretrained_models[name],
+        )
+        adapted_models[name] = m
+        log.info("  %s: added %d trees (total ~%d)",
+                 name, m.best_iteration_, base_trees + m.best_iteration_)
+
+    test_n    = min(val_n, len(recent_df) // 4)
+    X_test_pt = X_recent.iloc[-test_n:]
+    y_test_pt = y_recent.iloc[-test_n:]
+    bl_test   = linear_baseline.predict(X_test_pt[trivial_avail])
+
+    return {
+        **pretrained_artifacts,
+        "models":               adapted_models,
+        "linear_baseline":      linear_baseline,
+        "posttrain_date":       str(df.index.max().date()),
+        "posttrain_window_days": window_days,
+        "_X_test":  X_test_pt,
+        "_y_test":  y_test_pt,
+        "_bl_test": bl_test,
+    }
+
+
 # ── Evaluate ───────────────────────────────────────────────────────────────────
 
 def evaluate(artifacts: dict, X_test=None, y_test=None, bl_test=None) -> dict:
@@ -712,6 +932,54 @@ def predict(
     return forecast
 
 
+# ── Save / load pretrained artifacts ─────────────────────────────────────────
+
+def save_pretrained(artifacts: dict, path: str | Path = MODEL_DIR) -> None:
+    """
+    Save Phase 1 base model to pretrained_models.pkl.
+    Kept separate from models.pkl so posttrain() can always find the frozen base.
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    save = {k: v for k, v in artifacts.items() if not k.startswith("_")}
+
+    with open(path / "pretrained_models.pkl",  "wb") as f:
+        pickle.dump(save["models"], f)
+    with open(path / "linear_baseline.pkl", "wb") as f:
+        pickle.dump(save["linear_baseline"], f)
+    with open(path / "neutralizers.pkl",    "wb") as f:
+        pickle.dump(save["neutralizers"], f)
+
+    config = {k: v for k, v in save.items()
+              if k not in ("models", "linear_baseline", "neutralizers")}
+    with open(path / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+    log.info("Pretrained artifacts saved to %s (%d features)",
+             path, len(save["feature_cols"]))
+
+
+def load_pretrained(path: str | Path = MODEL_DIR) -> dict:
+    """Load Phase 1 frozen base for use in posttrain()."""
+    path = Path(path)
+    pretrained_pkl = path / "pretrained_models.pkl"
+    if not pretrained_pkl.exists():
+        raise FileNotFoundError(
+            f"No pretrained model found at {pretrained_pkl}. "
+            "Run POST /pretrain or `python ml.py --pretrain` first."
+        )
+    with open(pretrained_pkl,               "rb") as f: models          = pickle.load(f)
+    with open(path / "linear_baseline.pkl", "rb") as f: linear_baseline = pickle.load(f)
+    with open(path / "neutralizers.pkl",    "rb") as f: neutralizers    = pickle.load(f)
+    with open(path / "config.json")              as f: config           = json.load(f)
+    return {
+        "models":          models,
+        "linear_baseline": linear_baseline,
+        "neutralizers":    neutralizers,
+        **config,
+    }
+
+
 # ── Save / load artifacts ──────────────────────────────────────────────────────
 
 def save_artifacts(artifacts: dict, path: str | Path = MODEL_DIR) -> None:
@@ -762,6 +1030,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="SE3 ML module")
     parser.add_argument("--train",    action="store_true", help="Retrain and save model")
+    parser.add_argument("--pretrain",  action="store_true",
+                        help="Phase 1: train on historical data, save pretrained_models.pkl")
+    parser.add_argument("--posttrain", action="store_true",
+                        help="Phase 2: extend pretrained model on recent 90 days")
     parser.add_argument("--forecast", action="store_true", help="Run live 24h forecast")
     parser.add_argument("--evaluate", action="store_true", help="Print test set metrics")
     parser.add_argument("--api-key",  default=None)
@@ -822,5 +1094,33 @@ if __name__ == "__main__":
         for k, v in metrics.items():
             if k != "mae_by_hour":
                 print(f"  {k:<22}: {v}")
+
+    elif args.pretrain:
+        data      = sync_all(api_key)
+        artifacts = pretrain(data)
+        metrics   = evaluate(artifacts)
+        print("\nPretrain test metrics:")
+        for k, v in metrics.items():
+            if k != "mae_by_hour":
+                print(f"  {k:<22}: {v}")
+        save_pretrained(artifacts)
+        with open(MODEL_DIR / "metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        log.info("Pretrain complete. Cutoff: %s", artifacts["pretrain_cutoff"])
+
+    elif args.posttrain:
+        data           = sync_all(api_key)
+        pretrained     = load_pretrained()
+        artifacts      = posttrain(data, pretrained)
+        metrics        = evaluate(artifacts)
+        print("\nPosttrain test metrics (recent window):")
+        for k, v in metrics.items():
+            if k != "mae_by_hour":
+                print(f"  {k:<22}: {v}")
+        save_artifacts(artifacts, MODEL_DIR)
+        with open(MODEL_DIR / "metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+        log.info("Posttrain complete. Date: %s", artifacts["posttrain_date"])
+
     else:
         parser.print_help()
