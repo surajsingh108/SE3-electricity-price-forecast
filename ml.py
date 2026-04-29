@@ -1072,6 +1072,7 @@ if __name__ == "__main__":
         log.info("Saved %d test set forecast hours to DB", len(test_fc))
 
     elif args.forecast:
+        from pipeline import save_forecast
         data       = sync_all(api_key)
         artifacts  = load_artifacts()
         weather_fc = fetch_weather_forecast()
@@ -1084,6 +1085,8 @@ if __name__ == "__main__":
             nuclear_gen = data.get("nuclear_gen"),
             flows_df    = data.get("flows_df"),
         )
+        save_forecast(forecast)
+        log.info("Forecast saved to DB (%d hours)", len(forecast))
         print("\nNext 24h SE3 price forecast (EUR/MWh):")
         print(forecast.round(1).to_string())
 
