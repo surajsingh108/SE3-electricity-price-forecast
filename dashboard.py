@@ -242,54 +242,54 @@ if page == "📈 Forecast":
     if df is None:
         st.info("No forecast found. The forecast job may not have run yet.")
         st.stop()
+    else:
+        tz  = pytz.timezone("Europe/Stockholm")
+        now = pd.Timestamp.now(tz=tz).floor("h")
+        df  = df[df.index >= now]
 
-    tz  = pytz.timezone("Europe/Stockholm")
-    now = pd.Timestamp.now(tz=tz).floor("h")
-    df  = df[df.index >= now]
+        if df.empty:
+            st.warning("Forecast has expired. Waiting for next forecast job run.")
+            st.stop()
+        else:
+            def highlight_now(row):
+                if row.name == now:
+                    return ["background-color: #1a3a4a"] * len(row)
+                return [""] * len(row)
 
-    if df.empty:
-        st.warning("Forecast has expired. Waiting for next forecast job run.")
-        st.stop()
+            col1, col2, col3, col4 = st.columns(4)
+            with col1: metric_card("Avg forecast",  f"{df['p50'].mean():.1f}", "EUR/MWh")
+            with col2: metric_card("Peak (p50)",    f"{df['p50'].max():.1f}",
+                                   f"at {df['p50'].idxmax().strftime('%H:%M')}", AMBER)
+            with col3:
+                night = df.loc[df.index.hour.isin([0,1,2,3,4,5]), "p50"]
+                metric_card("Overnight low", f"{night.min():.1f}" if not night.empty else "—",
+                            "EUR/MWh  00–05h", BLUE)
+            with col4: metric_card("Uncertainty",
+                                   f"±{((df['p95']-df['p05'])/2).mean():.1f}",
+                                   "avg half-width EUR/MWh", GRAY)
 
-    def highlight_now(row):
-        if row.name == now:
-            return ["background-color: #1a3a4a"] * len(row)
-        return [""] * len(row)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(df.index)+list(df.index[::-1]),
+                y=list(df["p95"])+list(df["p05"][::-1]),
+                fill="toself", fillcolor=BAND,
+                line=dict(color="rgba(0,0,0,0)"),
+                name="90% confidence band",
+            ))
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df["p50"],
+                name="Forecast (median)",
+                line=dict(color=BLUE, width=2.5),
+            ))
+            plotly_layout(fig, "SE3 Next 24h Price Forecast")
+            fig.update_xaxes(range=[now, now + pd.Timedelta(hours=24)])
+            st.plotly_chart(fig, use_container_width=True)
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1: metric_card("Avg forecast",  f"{df['p50'].mean():.1f}", "EUR/MWh")
-    with col2: metric_card("Peak (p50)",    f"{df['p50'].max():.1f}",
-                           f"at {df['p50'].idxmax().strftime('%H:%M')}", AMBER)
-    with col3:
-        night = df.loc[df.index.hour.isin([0,1,2,3,4,5]), "p50"]
-        metric_card("Overnight low", f"{night.min():.1f}" if not night.empty else "—",
-                    "EUR/MWh  00–05h", BLUE)
-    with col4: metric_card("Uncertainty",
-                           f"±{((df['p95']-df['p05'])/2).mean():.1f}",
-                           "avg half-width EUR/MWh", GRAY)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=list(df.index)+list(df.index[::-1]),
-        y=list(df["p95"])+list(df["p05"][::-1]),
-        fill="toself", fillcolor=BAND,
-        line=dict(color="rgba(0,0,0,0)"),
-        name="90% confidence band",
-    ))
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["p50"],
-        name="Forecast (median)",
-        line=dict(color=BLUE, width=2.5),
-    ))
-    plotly_layout(fig, "SE3 Next 24h Price Forecast")
-    fig.update_xaxes(range=[now, now + pd.Timedelta(hours=24)])
-    st.plotly_chart(fig, use_container_width=True)
-
-    with st.expander("📋 Hourly forecast table"):
-        table = df.copy()
-        table.columns = ["Lower (q5)", "Median (q50)", "Upper (q95)"]
-        st.dataframe(table.round(2).style.apply(highlight_now, axis=1),
-                     use_container_width=True)
+            with st.expander("📋 Hourly forecast table"):
+                table = df.copy()
+                table.columns = ["Lower (q5)", "Median (q50)", "Upper (q95)"]
+                st.dataframe(table.round(2).style.apply(highlight_now, axis=1),
+                             use_container_width=True)
 
 
 # ── Page: Performance ─────────────────────────────────────────────────────────

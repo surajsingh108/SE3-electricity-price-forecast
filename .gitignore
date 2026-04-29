@@ -6,10 +6,13 @@
 # ── Data cache ────────────────────────────────────────────────────────────────
 data/
 *.duckdb
+*.duckdb.wal
 *.sqlite
+
 # ── Model artifacts ───────────────────────────────────────────────────────────
 model/
 *.pkl
+metrics.json
 
 # ── Weather API cache ─────────────────────────────────────────────────────────
 .weather_cache/
@@ -36,9 +39,12 @@ ENV/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# ── IDE ───────────────────────────────────────────────────────────────────────
+# ── IDE / tooling ─────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+.claude/
+.mypy_cache/
+.ruff_cache/
 *.swp
 *.swo
 .DS_Store

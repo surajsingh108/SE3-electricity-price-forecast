@@ -1039,7 +1039,7 @@ if __name__ == "__main__":
     parser.add_argument("--api-key",  default=None)
     args = parser.parse_args()
 
-    from pipeline import sync_all, fetch_weather_forecast, print_status
+    from pipeline import sync_all, fetch_weather_forecast
 
     api_key = args.api_key or os.environ.get("ENTSOE_API_KEY", "")
 
