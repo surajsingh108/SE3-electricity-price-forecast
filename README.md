@@ -1,22 +1,22 @@
-# ⚡ SE3 Electricity Price Forecast Dashboard
+# ⚡ SE3 Electricity Price Forecast
 
-A production-grade day-ahead electricity price forecasting system for the **SE3 bidding area** (Sweden), built with LightGBM, FastAPI, and Streamlit — deployed on GCP free tier.
+A production-grade day-ahead electricity price forecasting system for the **SE3 bidding area** (Sweden), built with LightGBM and Streamlit — deployed on Google Cloud Run.
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![LightGBM](https://img.shields.io/badge/LightGBM-quantile-green)
-![FastAPI](https://img.shields.io/badge/FastAPI-backend-009688)
 ![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B)
 ![GCP](https://img.shields.io/badge/GCP-Cloud%20Run-4285F4)
+
+**Live dashboard:** https://se3-dashboard-458800722354.europe-north1.run.app
 
 ---
 
 ## What it does
 
 - Forecasts SE3 electricity prices **24 hours ahead** with 90% confidence intervals
-- Retrains automatically every day on fresh data
 - Syncs data hourly from ENTSO-E and Open-Meteo
-- Serves forecasts via a REST API
-- Displays results in an interactive Streamlit dashboard
+- Retrains the model weekly on fresh data
+- Reads data directly from DuckDB — no API layer needed
 
 ---
 
@@ -26,37 +26,34 @@ A production-grade day-ahead electricity price forecasting system for the **SE3 
 |---|---|
 | 📈 **Forecast** | Next 24h price forecast with confidence band, hourly table |
 | 📊 **Performance** | MAE, RMSE, MAPE, PI coverage, MAE by hour of day |
-| 🔍 **Backtesting** | Actual vs forecast for any date range, error distribution |
-| 🗄️ **Data explorer** | Raw prices, weather, generation data with CSV export |
+| 📉 **Backtesting** | Actual vs forecast for any date range, error distribution |
+| 🗃️ **Data** | Raw prices, weather, generation with CSV export |
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   Cloud Run (GCP)                   │
-│                                                     │
-│   supervisord                                       │
-│   ├── uvicorn api:app        :8000  (internal)      │
-│   └── streamlit dashboard    :8080  (public)        │
-└──────────────────┬──────────────────────────────────┘
-                   │
-          Cloud Storage (GCP)
-          ├── data/se3_cache.duckdb   ← all fetched data
-          └── model/                  ← trained artifacts
+GCS bucket: se3-cache
+├── se3_cache.duckdb      ← all fetched data + saved forecasts
+├── models.pkl            ← trained LightGBM models
+├── pretrained_models.pkl
+└── metrics.json + other artifacts
 
-Cloud Scheduler (GCP)
-├── Hourly  → pipeline.py   (incremental data sync)
-└── Daily   → POST /retrain (model retrain at 03:00)
+Cloud Run SERVICE: se3-dashboard   ← Streamlit reads DuckDB via GCS volume mount
+Cloud Run JOBS:
+  ├── pipeline-job   ← hourly data sync (ENTSO-E + Open-Meteo)
+  ├── forecast-job   ← daily forecast generation (10:00 Stockholm)
+  └── train-job      ← weekly posttrain (Sunday 02:00 Stockholm)
+Cloud Scheduler: 3 cron jobs triggering the above
 ```
 
 ### Data sources
 
-| Source | Data | Auth |
-|---|---|---|
-| [ENTSO-E Transparency Platform](https://transparency.entsoe.eu) | Day-ahead prices, generation, load, nuclear output, cross-border flows | Free account |
-| [Open-Meteo](https://open-meteo.com) | Historical + forecast weather (temp, wind 10m/100m, cloud, solar) | None |
+| Source | Data |
+|---|---|
+| [ENTSO-E Transparency Platform](https://transparency.entsoe.eu) | Day-ahead prices, generation, load, nuclear output, cross-border flows |
+| [Open-Meteo](https://open-meteo.com) | Historical + forecast weather (temp, wind 10m/100m, cloud, solar) |
 
 ---
 
@@ -69,18 +66,18 @@ Cloud Scheduler (GCP)
 | Group | Examples |
 |---|---|
 | Price anchors | EWA same-hour mean, lag 24h/48h/168h, rolling 7d/30d stats |
-| Calendar | Fourier harmonics k1+k2+k3 (daily, weekly, annual), cyclical hour/month/DOW |
+| Calendar | Fourier harmonics k1–k3 (daily, weekly, annual), hour/month/DOW |
 | Weather | windspeed_100m, wind_surprise, heating_degree, cloudcover |
 | Generation | wind_gen_lag24, load_lag24, load_residual |
 | Nuclear | nuclear_gen_lag24, nuclear_shortfall (outage proxy) |
 | Cross-border flows | flow_no1_lag24, flow_se4_lag24, net_pos_roll7d |
 
 ### Key design decisions
-- **EWA anchor** instead of simple 7-day mean — adapts faster to price regime shifts
-- **Fourier k2 harmonics** — captures double morning+evening peak structure
+- **EWA anchor** — exponentially weighted average adapts faster to price regime shifts than a simple rolling mean
+- **Fourier k2 harmonics** — captures the double morning+evening peak structure
 - **V2 feature neutralization** — weather features orthogonalized against seasonal Fourier basis
 - **V3 target neutralization** — LightGBM trains on residuals from a Ridge linear baseline
-- **Zero data leakage** — all features shifted ≥ 24h; no same-hour nuclear or flow values
+- **Zero data leakage** — all features shifted ≥ 24h
 
 ---
 
@@ -88,18 +85,13 @@ Cloud Scheduler (GCP)
 
 ```
 se3-forecast/
-├── pipeline.py          # Module 1 — data sync, DuckDB cache, scheduler
-├── ml.py                # Module 2 — feature engineering, train, predict, evaluate
-├── api.py               # Module 3 — FastAPI backend (6 endpoints)
-├── dashboard.py         # Module 4 — Streamlit dashboard (4 pages)
-├── Dockerfile           # Combined API + dashboard container
-├── supervisord.conf     # Process supervisor config
+├── pipeline.py          # Data sync — fetches ENTSO-E + weather into DuckDB
+├── ml.py                # ML — feature engineering, train, predict, evaluate
+├── dashboard.py         # Streamlit dashboard (4 pages, reads DuckDB directly)
+├── Dockerfile           # Single image used for dashboard + all Cloud Run Jobs
 ├── requirements.txt     # Python dependencies
 ├── .env.example         # Environment variable template
-├── .gitignore
-├── .dockerignore
-├── DEPLOY.md            # Step-by-step GCP deployment guide
-└── se3_forecast_architecture.md  # Full architecture reference
+└── notebooks/           # Exploratory analysis
 ```
 
 ---
@@ -109,8 +101,8 @@ se3-forecast/
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/se3-forecast.git
-cd se3-forecast
+git clone https://github.com/surajsingh108/SE3-electricity-price-forecast.git
+cd SE3-electricity-price-forecast
 pip install -r requirements.txt
 ```
 
@@ -118,93 +110,68 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env and add your ENTSO-E API key
-# Get a free key at: https://transparency.entsoe.eu/usrm/user/myAccountSettings
+# Add your ENTSO-E API key — free at https://transparency.entsoe.eu
 ```
 
-### 3. Fetch data and train model
+### 3. Sync data and train
 
 ```bash
 python pipeline.py          # fetch all data (~10 min first run)
-python ml.py --train        # train model and save artifacts
+python ml.py --pretrain     # full pretrain on all historical data
+python ml.py --forecast     # generate first forecast and save to DB
 ```
 
-### 4. Run the full stack
+### 4. Run the dashboard
 
 ```bash
-# Terminal 1
-python api.py
-
-# Terminal 2
 streamlit run dashboard.py
 ```
 
-Open `http://localhost:8501` in your browser.
+Open `http://localhost:8501`.
 
 ---
 
 ## Docker (local test)
 
 ```bash
-docker build -t se3-forecast .
+docker build -t se3:test .
 
+# Dashboard
 docker run -p 8080:8080 \
   --env-file .env \
   -v $(pwd)/data:/app/data \
   -v $(pwd)/model:/app/model \
-  se3-forecast
+  se3:test
+
+# Run a job manually
+docker run --rm --env-file .env \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/model:/app/model \
+  se3:test python pipeline.py
 ```
 
-Open `http://localhost:8080`.
-
 ---
 
-## API endpoints
+## GCP Deployment summary
 
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/health` | Service health check |
-| GET | `/forecast` | Next 24h price forecast (cached 5 min) |
-| GET | `/metrics` | Latest model performance metrics |
-| GET | `/history` | Actuals vs saved forecasts for a date range |
-| GET | `/prices` | Raw hourly SE3 prices |
-| GET | `/weather` | Raw hourly weather data |
-| GET | `/generation` | Raw hourly generation data |
-| POST | `/retrain` | Trigger model retrain (requires `X-Secret` header) |
+One image, one bucket, three jobs.
 
-Interactive API docs at `http://localhost:8000/docs`.
-
----
-
-## GCP Deployment
-
-See **[DEPLOY.md](DEPLOY.md)** for the full step-by-step guide.
-
-**Summary:**
 ```bash
-# Build and push image
-gcloud builds submit --tag $IMAGE .
+# 1. Build and push
+gcloud builds submit --tag=REGION-docker.pkg.dev/PROJECT/REPO/se3 .
 
-# Deploy to Cloud Run (free tier)
-gcloud run deploy se3-forecast --image=$IMAGE --region=europe-north1
+# 2. Deploy dashboard (GCS volume mount)
+gcloud run deploy se3-dashboard --image=IMAGE \
+  --add-volume=name=gcs-data,type=cloud-storage,bucket=se3-cache \
+  --add-volume-mount=volume=gcs-data,mount-path=/app/data \
+  --add-volume-mount=volume=gcs-data,mount-path=/app/model \
+  --set-env-vars=SE3_DB_PATH=/app/data/se3_cache.duckdb,MODEL_DIR=/app/model
 
-# Schedule daily retrain
-gcloud scheduler jobs create http se3-daily-retrain \
-  --schedule="0 3 * * *" --uri="$SERVICE_URL/retrain" \
-  --http-method=POST --headers="X-Secret=$RETRAIN_SECRET"
+# 3. Deploy jobs (same image, different CMD)
+gcloud run jobs deploy pipeline-job --image=IMAGE --command=python --args=pipeline.py
+gcloud run jobs deploy forecast-job --image=IMAGE --command=python --args="ml.py,--forecast"
+gcloud run jobs deploy train-job    --image=IMAGE --command=python --args="ml.py,--posttrain"
 ```
-
----
-
-## GCP Free Tier Usage
-
-| Service | Limit | This project |
-|---|---|---|
-| Cloud Run | 2M requests/month | ~3k/month |
-| Cloud Storage | 5 GB | ~500 MB |
-| Cloud Scheduler | 3 jobs | 2 jobs |
-| Artifact Registry | 0.5 GB | ~500 MB |
-| **Cost** | | **$0/month** |
 
 ---
 
@@ -213,11 +180,8 @@ gcloud scheduler jobs create http se3-daily-retrain \
 | Variable | Required | Description |
 |---|---|---|
 | `ENTSOE_API_KEY` | ✅ | ENTSO-E Transparency Platform API key |
-| `RETRAIN_SECRET` | ✅ | Secret for `POST /retrain` endpoint |
-| `API_URL` | ✅ | URL of the FastAPI backend (default: `http://localhost:8000`) |
 | `SE3_DB_PATH` | | Path to DuckDB file (default: `data/se3_cache.duckdb`) |
-| `MODEL_DIR` | | Path to model artifacts (default: `model/`) |
-| `FORECAST_CACHE_TTL` | | Forecast cache TTL in seconds (default: `300`) |
+| `MODEL_DIR` | | Path to model artifacts directory (default: `model`) |
 
 ---
 
@@ -227,13 +191,11 @@ gcloud scheduler jobs create http se3-daily-retrain \
 |---|---|
 | Data storage | [DuckDB](https://duckdb.org) — columnar, zero-setup, single file |
 | ML model | [LightGBM](https://lightgbm.readthedocs.io) — quantile regression |
-| Feature importance | [SHAP](https://shap.readthedocs.io) |
-| API | [FastAPI](https://fastapi.tiangolo.com) + [Uvicorn](https://www.uvicorn.org) |
 | Dashboard | [Streamlit](https://streamlit.io) + [Plotly](https://plotly.com) |
-| Process management | [Supervisor](http://supervisord.org) |
 | Container | Docker → GCP Cloud Run |
 | Data pipeline | [entsoe-py](https://github.com/EnergieID/entsoe-py) + [Open-Meteo](https://open-meteo.com) |
-| Scheduling | GCP Cloud Scheduler |
+| Scheduling | GCP Cloud Scheduler + Cloud Run Jobs |
+| Storage | GCP Cloud Storage (GCS FUSE volume mount) |
 
 ---
 
