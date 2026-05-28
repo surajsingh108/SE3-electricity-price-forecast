@@ -45,6 +45,8 @@ ENV/
 .claude/
 .mypy_cache/
 .ruff_cache/
+.pytest_cache/
+test_*.py
 *.swp
 *.swo
 .DS_Store

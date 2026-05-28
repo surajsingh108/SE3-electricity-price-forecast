@@ -20,3 +20,10 @@ pytz
 
 # Utilities
 google-cloud-storage
+
+# Agent & API
+google-genai>=0.8.0
+langgraph>=0.2.0
+fastapi
+uvicorn
+httpx

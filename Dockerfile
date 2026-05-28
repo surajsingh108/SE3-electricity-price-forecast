@@ -14,7 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && find /root/.local/lib -path "*/streamlit/static*" -name "*.map" \
        -delete 2>/dev/null; true
 
-COPY pipeline.py ml.py dashboard.py ./
+COPY pipeline.py ml.py dashboard.py api.py ./
+COPY agent ./agent
 
 RUN mkdir -p /app/data /app/model
 
@@ -24,10 +25,11 @@ ENV SE3_DB_PATH=/app/data/se3_cache.duckdb \
     PYTHONUNBUFFERED=1 \
     PORT=8080
 
-# Default: dashboard. Jobs override CMD at deploy time.
-CMD streamlit run dashboard.py \
-    --server.port=$PORT \
-    --server.address=0.0.0.0 \
-    --server.headless=true \
-    --server.fileWatcherType=none \
-    --browser.gatherUsageStats=false
+COPY supervisord.conf .
+
+RUN pip install --no-cache-dir supervisor
+
+EXPOSE 8080
+
+# Run both api.py and dashboard.py via supervisord
+CMD ["supervisord", "-c", "/app/supervisord.conf"]

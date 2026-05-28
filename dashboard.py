@@ -201,7 +201,7 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "Navigate",
-        ["📈 Forecast", "📊 Performance", "📉 Backtesting", "🗃️ Data"],
+        ["📈 Forecast", "📊 Performance", "📉 Backtesting", "🗃️ Data", "💬 Ask SE3"],
         label_visibility="collapsed",
     )
     st.markdown("---")
@@ -522,6 +522,66 @@ elif page == "🗃️ Data":
         st.download_button("⬇️ Download CSV", data=csv,
             file_name=f"se3_{dataset.lower()}_{from_date}_{to_date}.csv",
             mime="text/csv")
+
+
+# ── Page: Ask SE3 ─────────────────────────────────────────────────────────────
+
+elif page == "💬 Ask SE3":
+    st.title("💬 Ask SE3")
+
+    import httpx
+    st.subheader("Ask anything about SE3 electricity prices")
+
+    API_URL = os.environ.get("API_URL", "http://localhost:8000")
+
+    if "se3_question" not in st.session_state:
+        st.session_state.se3_question = ""
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        if st.button("Why is SE3 expensive right now?"):
+            st.session_state.se3_question = "Why is SE3 electricity expensive right now?"
+    with col2:
+        if st.button("What will prices look like tomorrow?"):
+            st.session_state.se3_question = "What will SE3 prices look like tomorrow?"
+    with col3:
+        if st.button("Should I run appliances now or wait?"):
+            st.session_state.se3_question = "Should I run my appliances now or wait for cheaper prices?"
+    with col4:
+        if st.button("Why is the price high?"):
+            st.session_state.se3_question = "Why is the SE3 electricity price high right now?"
+
+    with st.form(key="ask_form"):
+        question = st.text_input("Or type your own question:", value=st.session_state.se3_question)
+        submitted = st.form_submit_button("Ask", type="primary")
+
+    if submitted and question:
+        st.session_state.se3_question = question
+        with st.spinner("Fetching live data and reasoning..."):
+            try:
+                r = httpx.post(f"{API_URL}/ask", json={"question": question}, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                st.markdown(f"### Answer\n{data['answer']}")
+                conf = data.get("confidence", 0)
+                st.progress(conf, text=f"Confidence: {int(conf * 100)}%")
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    if data.get("current_price_eur_mwh") is not None:
+                        st.metric("Current Price", f"{data['current_price_eur_mwh']:.1f} EUR/MWh")
+                with col_b:
+                    if data.get("forecast_p50_next_hour") is not None:
+                        st.metric("Forecast (next hour)", f"{data['forecast_p50_next_hour']:.1f} EUR/MWh")
+                with col_c:
+                    if data.get("forecast_delta") is not None:
+                        st.metric("Forecast vs Current", f"{data['forecast_delta']:+.1f} EUR/MWh")
+                with st.expander("Data sources used"):
+                    st.write("**Tools called:**", ", ".join(data.get("tools_called", [])))
+                    if data.get("tools_failed"):
+                        st.warning(f"Tools that failed: {', '.join(data['tools_failed'])}")
+                    st.write("**Sources:**", ", ".join(data.get("sources", [])))
+            except Exception as e:
+                st.error(f"Error: {type(e).__name__}: {e}")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────
