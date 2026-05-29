@@ -174,6 +174,33 @@ def fetch_history(from_date: str, to_date: str) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_weather_range(from_date: str, to_date: str) -> pd.DataFrame:
+    """Load weather and SMHI wind forecast for the date range."""
+    try:
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        df_w = conn.execute("""
+            SELECT w.timestamp,
+                   w.windspeed_100m,
+                   w.temperature,
+                   s.smhi_wind_speed_ms
+            FROM weather w
+            LEFT JOIN smhi_wind_forecast s ON w.timestamp = s.timestamp
+            WHERE w.timestamp >= ? AND w.timestamp <= ?
+            ORDER BY w.timestamp
+        """, [from_date, to_date]).df()
+        conn.close()
+        if df_w.empty:
+            return pd.DataFrame()
+        df_w["timestamp"] = pd.to_datetime(
+            df_w["timestamp"], utc=True
+        ).dt.tz_convert("Europe/Stockholm")
+        return df_w.set_index("timestamp")
+    except Exception as e:
+        st.warning(f"Could not load weather overlays: {e}")
+        return pd.DataFrame()
+
+
 def metric_card(label, value, sub="", color=BLUE):
     st.markdown(f"""
     <div class="metric-card">
@@ -359,8 +386,16 @@ elif page == "📉 Backtesting":
         st.error("From date must be before To date.")
         st.stop()
 
+    overlay = st.multiselect(
+        "Overlay on chart",
+        ["Wind speed (100m)", "SMHI Wind Forecast",
+         "Forecast error (actual – p50)", "Temperature"],
+        default=[]
+    )
+
     with st.spinner("Loading history..."):
         df = fetch_history(str(from_date), str(to_date))
+        df_weather = fetch_weather_range(str(from_date), str(to_date))
 
     if df.empty:
         st.info("No data for this range.")
@@ -385,18 +420,93 @@ elif page == "📉 Backtesting":
             metric_card("PI Coverage", "—", "no forecast data")
 
     st.markdown("---")
-    fig = go.Figure()
+
+    from plotly.subplots import make_subplots
+
+    needs_secondary = any(o in overlay for o in [
+        "Wind speed (100m)", "SMHI Wind Forecast", "Temperature"
+    ])
+
+    fig = make_subplots(specs=[[{"secondary_y": needs_secondary}]])
+
+    # Confidence band
     if has_fc.any():
         fc_df = df[has_fc]
         fig.add_trace(go.Scatter(
-            x=list(fc_df.index)+list(fc_df.index[::-1]),
-            y=list(fc_df["p95"])+list(fc_df["p05"][::-1]),
+            x=list(fc_df.index) + list(fc_df.index[::-1]),
+            y=list(fc_df["p95"]) + list(fc_df["p05"][::-1]),
             fill="toself", fillcolor=BAND,
-            line=dict(color="rgba(0,0,0,0)"), name="90% band"))
-        fig.add_trace(go.Scatter(x=fc_df.index, y=fc_df["p50"],
-            name="Forecast (median)", line=dict(color=BLUE, width=1.8)))
-    fig.add_trace(go.Scatter(x=df.index, y=df["actual"],
-        name="Actual", line=dict(color=ACTUAL, width=1.5)))
+            line=dict(color="rgba(0,0,0,0)"),
+            name="90% band"),
+            secondary_y=False)
+        fig.add_trace(go.Scatter(
+            x=fc_df.index, y=fc_df["p50"],
+            name="Forecast (median)",
+            line=dict(color=BLUE, width=1.8)),
+            secondary_y=False)
+
+    # Actual price
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["actual"],
+        name="Actual",
+        line=dict(color=ACTUAL, width=1.5)),
+        secondary_y=False)
+
+    # Forecast error bars
+    if "Forecast error (actual – p50)" in overlay and has_fc.any():
+        errors = fc_df["actual"] - fc_df["p50"]
+        fig.add_trace(go.Bar(
+            x=fc_df.index,
+            y=errors,
+            name="Error (actual – p50)",
+            marker_color=[
+                "rgba(239,68,68,0.5)" if v > 0
+                else "rgba(59,130,246,0.5)"
+                for v in errors
+            ],
+            opacity=0.6),
+            secondary_y=False)
+
+    # Wind speed (Open-Meteo actual)
+    if "Wind speed (100m)" in overlay and not df_weather.empty:
+        if "windspeed_100m" in df_weather.columns:
+            fig.add_trace(go.Scatter(
+                x=df_weather.index,
+                y=df_weather["windspeed_100m"],
+                name="Wind speed 100m (m/s)",
+                line=dict(color="rgba(16,185,129,0.9)",
+                          width=1.5, dash="dot")),
+                secondary_y=True)
+
+    # SMHI wind forecast
+    if "SMHI Wind Forecast" in overlay and not df_weather.empty:
+        if "smhi_wind_speed_ms" in df_weather.columns:
+            fig.add_trace(go.Scatter(
+                x=df_weather.index,
+                y=df_weather["smhi_wind_speed_ms"],
+                name="SMHI Wind Forecast (m/s)",
+                line=dict(color="rgba(52,211,153,0.9)",
+                          width=1.5, dash="dash")),
+                secondary_y=True)
+
+    # Temperature
+    if "Temperature" in overlay and not df_weather.empty:
+        if "temperature" in df_weather.columns:
+            fig.add_trace(go.Scatter(
+                x=df_weather.index,
+                y=df_weather["temperature"],
+                name="Temperature (°C)",
+                line=dict(color="rgba(251,146,60,0.9)",
+                          width=1.5, dash="dot")),
+                secondary_y=True)
+
+    fig.update_yaxes(title_text="Price (EUR/MWh)", secondary_y=False)
+    if needs_secondary:
+        fig.update_yaxes(
+            title_text="Wind (m/s) / Temp (°C)",
+            secondary_y=True,
+            showgrid=False
+        )
     plotly_layout(fig, "Actual vs Forecast")
     st.plotly_chart(fig, use_container_width=True)
 

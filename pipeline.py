@@ -77,6 +77,17 @@ def _create_tables(conn):
             timestamp TIMESTAMPTZ, generated_at TIMESTAMPTZ,
             p05 DOUBLE, p50 DOUBLE, p95 DOUBLE,
             PRIMARY KEY (timestamp, generated_at))""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS smhi_wind_forecast (
+            timestamp             TIMESTAMPTZ PRIMARY KEY,
+            smhi_wind_speed_ms    DOUBLE,
+            smhi_wind_gust_ms     DOUBLE,
+            smhi_cloud_fraction   DOUBLE,
+            smhi_temperature_c    DOUBLE,
+            smhi_precip_prob      DOUBLE,
+            smhi_symbol_code      INTEGER,
+            fetched_at            TIMESTAMPTZ
+        )""")
 
 
 def _cached_max(conn, table, border=None):
@@ -215,6 +226,91 @@ def fetch_weather_forecast():
     }).set_index("timestamp")
 
 
+SMHI_LOCATIONS = {
+    "stockholm":  (59.33, 18.07),
+    "sundsvall":  (62.39, 17.31),
+    "gothenburg": (57.71, 11.97),
+    "vasteras":   (59.62, 16.54),
+}
+
+
+def fetch_smhi_wind_forecast() -> pd.DataFrame:
+    """
+    Fetches wind speed forecasts from SMHI Open Data API (SNOW1gv1)
+    for key SE3 locations. No API key required.
+    Returns hourly DataFrame with avg wind forecast across locations.
+    """
+    import requests
+
+    SMHI_BASE = (
+        "https://opendata-download-metfcst.smhi.se/api/category/snow1g"
+        "/version/1/geotype/point/lon/{lon}/lat/{lat}/data.json"
+    )
+
+    all_frames = []
+
+    for location, (lat, lon) in SMHI_LOCATIONS.items():
+        try:
+            url = SMHI_BASE.format(lat=lat, lon=lon)
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+
+            rows = []
+            for entry in data.get("timeSeries", []):
+                ts = pd.Timestamp(entry["time"])
+                if ts.tz is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
+                d = entry.get("data", {})
+                rows.append({
+                    "timestamp":            ts,
+                    "location":             location,
+                    "wind_speed_ms":        d.get("wind_speed",              None),
+                    "wind_dir_deg":         d.get("wind_from_direction",     None),
+                    "wind_gust_ms":         d.get("wind_speed_of_gust",      None),
+                    "cloud_fraction":       d.get("cloud_area_fraction",     None),
+                    "temperature_c":        d.get("air_temperature",         None),
+                    "precip_probability":   d.get("probability_of_precipitation", None),
+                    "symbol_code":          d.get("symbol_code",             None),
+                })
+
+            df_loc = pd.DataFrame(rows)
+            all_frames.append(df_loc)
+            log.info(f"SMHI {location}: {len(df_loc)} forecast hours")
+
+        except Exception as e:
+            log.warning(f"SMHI fetch failed for {location}: {e}")
+
+    if not all_frames:
+        return pd.DataFrame()
+
+    df_all = pd.concat(all_frames, ignore_index=True)
+
+    # Average across SE3 locations – one row per timestamp
+    df_avg = (
+        df_all
+        .groupby("timestamp")[["wind_speed_ms", "wind_gust_ms", "cloud_fraction",
+                                "temperature_c", "precip_probability"]]
+        .mean()
+        .reset_index()
+        .rename(columns={
+            "wind_speed_ms":      "smhi_wind_speed_ms",
+            "wind_gust_ms":       "smhi_wind_gust_ms",
+            "cloud_fraction":     "smhi_cloud_fraction",
+            "temperature_c":      "smhi_temperature_c",
+            "precip_probability": "smhi_precip_prob",
+        })
+    )
+    # Mode for symbol_code (most common value)
+    df_symbol = df_all.groupby("timestamp")["symbol_code"].agg(lambda x: x.mode()[0] if not x.mode().empty else None).reset_index()
+    df_symbol.rename(columns={"symbol_code": "smhi_symbol_code"}, inplace=True)
+    df_avg = df_avg.merge(df_symbol, on="timestamp", how="left")
+    df_avg["fetched_at"] = pd.Timestamp.now("UTC")
+    return df_avg
+
+
 def sync_generation(client, start, end):
     conn = get_conn()
     gap = _gap(conn, "generation", start, end)
@@ -347,6 +443,24 @@ def sync_all(api_key=None) -> dict:
     log.info("Syncing %s → %s", start.date(), end.date())
     prices      = sync_prices(client, start, end)
     weather     = sync_weather(start, end)
+
+    # SMHI wind forecast
+    log.info("Fetching SMHI wind forecast...")
+    df_smhi = fetch_smhi_wind_forecast()
+    if not df_smhi.empty:
+        conn = get_conn()
+        conn.register("_smhi", df_smhi)
+        conn.execute("""
+            INSERT OR REPLACE INTO smhi_wind_forecast
+            SELECT timestamp, smhi_wind_speed_ms, smhi_wind_gust_ms,
+                   smhi_cloud_fraction, smhi_temperature_c, smhi_precip_prob,
+                   smhi_symbol_code, fetched_at
+            FROM _smhi
+        """)
+        conn.unregister("_smhi")
+        conn.close()
+        log.info(f"SMHI: stored {len(df_smhi)} forecast rows")
+
     gen         = sync_generation(client, start, end)
     nuclear_gen = sync_nuclear(client, start, end)
     flows_df    = sync_flows(client, start, end)

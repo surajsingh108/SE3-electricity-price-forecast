@@ -59,6 +59,10 @@ NEUTRALIZE_FEATS = [
     "load_lag24", "load_residual",
     "wind_gen_lag24", "wind_load_ratio",
     "cloudcover",
+    "smhi_wind_speed_ms",
+    "smhi_wind_surprise",
+    "smhi_cloud_fraction",
+    "smhi_temperature_c",
 ]
 
 LGBM_PARAMS = {
@@ -194,6 +198,30 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     X["temp_x_night"]  = X["temperature"] * X["is_night"]
     X["temp_x_peak"]   = X["temperature"] * X["is_peak"]
     X["temp_x_winter"] = X["temperature"] * (X["season"]==1).astype(int)
+
+    # ── SMHI wind forecast features – actual forward-looking wind forecast ───────
+    # Join on timestamp directly (no lag needed – these ARE forecasts)
+    if "smhi_wind_speed_ms" in X.columns:
+        # Wind surprise: difference between SMHI forecast and Open-Meteo actual
+        # Large positive = wind stronger than forecast (price pressure down)
+        # Large negative = wind weaker than forecast (price pressure up)
+        if wind_col in X.columns:
+            X["smhi_wind_surprise"] = (
+                X["smhi_wind_speed_ms"] - X[wind_col]
+            )
+        log.info("SMHI wind forecast features added.")
+    else:
+        X["smhi_wind_speed_ms"]  = np.nan
+        X["smhi_wind_gust_ms"]   = np.nan
+        X["smhi_wind_surprise"]  = np.nan
+
+    # SMHI cloud and temperature (forward-looking)
+    if "smhi_cloud_fraction" not in X.columns:
+        X["smhi_cloud_fraction"] = np.nan
+    if "smhi_temperature_c" not in X.columns:
+        X["smhi_temperature_c"] = np.nan
+    if "smhi_precip_prob" not in X.columns:
+        X["smhi_precip_prob"] = np.nan
 
     # ── Generation (all lagged ≥ 24h) ─────────────────────────────────────────
     if "wind_gen_mw" in X.columns:
