@@ -25,6 +25,7 @@ import argparse
 import holidays
 import json
 import logging
+import os
 import pickle
 from pathlib import Path
 
@@ -35,6 +36,8 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 log = logging.getLogger("ml")
+
+DB_PATH = os.environ.get("SE3_DB_PATH", "data/se3_cache.duckdb")
 
 SE_HOLIDAYS = holidays.Sweden()
 MODEL_DIR   = Path("model")
@@ -63,6 +66,12 @@ NEUTRALIZE_FEATS = [
     "smhi_wind_surprise",
     "smhi_cloud_fraction",
     "smhi_temperature_c",
+    "fcst_wind_100m",
+    "fcst_wind_10m",
+    "fcst_cloud_cover",
+    "fcst_temperature",
+    "fcst_wind_surprise",
+    "fcst_cloud_surprise",
 ]
 
 LGBM_PARAMS = {
@@ -198,6 +207,49 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     X["temp_x_night"]  = X["temperature"] * X["is_night"]
     X["temp_x_peak"]   = X["temperature"] * X["is_peak"]
     X["temp_x_winter"] = X["temperature"] * (X["season"]==1).astype(int)
+
+    # ── Open-Meteo forecast features – historical forecast data for training ──────
+    # Join forecast features – what the model predicted, not actuals
+    try:
+        import duckdb
+        con_fc = duckdb.connect(DB_PATH, read_only=True)
+        df_fc = con_fc.execute("""
+            SELECT timestamp,
+                   fcst_wind_100m,
+                   fcst_wind_10m,
+                   fcst_cloud_cover,
+                   fcst_temperature
+            FROM weather_forecast
+        """).df()
+        con_fc.close()
+
+        df_fc["timestamp"] = pd.to_datetime(df_fc["timestamp"], utc=True)
+        df_fc = df_fc.set_index("timestamp")
+        X = X.join(df_fc, how="left")
+
+        # Wind forecast surprise vs actual (key signal)
+        # Positive = wind stronger than forecast – price pressure down
+        # Negative = wind weaker than forecast – price pressure up (spike risk)
+        if "windspeed_100m" in X.columns and "fcst_wind_100m" in X.columns:
+            X["fcst_wind_surprise"] = (
+                X["windspeed_100m"] - X["fcst_wind_100m"]
+            )
+
+        # Cloud forecast surprise vs actual
+        if "cloudcover" in X.columns and "fcst_cloud_cover" in X.columns:
+            X["fcst_cloud_surprise"] = (
+                X["cloudcover"] - X["fcst_cloud_cover"]
+            )
+
+        coverage = X["fcst_wind_100m"].notna().mean()
+        log.info(f"Forecast feature coverage: {coverage:.1%}")
+
+    except Exception as e:
+        log.warning(f"Could not load weather_forecast features: {e}")
+        for col in ["fcst_wind_100m", "fcst_wind_10m",
+                    "fcst_cloud_cover", "fcst_temperature",
+                    "fcst_wind_surprise", "fcst_cloud_surprise"]:
+            X[col] = np.nan
 
     # ── SMHI wind forecast features – actual forward-looking wind forecast ───────
     # Join on timestamp directly (no lag needed – these ARE forecasts)

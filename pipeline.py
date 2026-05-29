@@ -88,6 +88,14 @@ def _create_tables(conn):
             smhi_symbol_code      INTEGER,
             fetched_at            TIMESTAMPTZ
         )""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS weather_forecast (
+            timestamp        TIMESTAMPTZ PRIMARY KEY,
+            fcst_wind_100m   DOUBLE,
+            fcst_wind_10m    DOUBLE,
+            fcst_cloud_cover DOUBLE,
+            fcst_temperature DOUBLE
+        )""")
 
 
 def _cached_max(conn, table, border=None):
@@ -434,6 +442,69 @@ def save_forecast(forecast_df: pd.DataFrame) -> None:
     conn.close()
 
 
+def backfill_openmeteo_forecasts(
+    start_date: str = "2020-01-01",
+    end_date: str | None = None,
+) -> int:
+    """
+    One-time backfill of Open-Meteo historical forecast data.
+    Fetches what the ECMWF forecast model predicted for each hour
+    (not reanalysis actuals) — genuine forecast features for ML training.
+    Safe to re-run: uses INSERT OR IGNORE so existing rows are preserved.
+    """
+    import requests
+
+    if end_date is None:
+        end_date = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+
+    log.info(f"Backfilling Open-Meteo forecasts {start_date} → {end_date}")
+
+    # Fetch for central SE3 (Stockholm)
+    url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude":   59.33,
+        "longitude":  18.07,
+        "start_date": start_date,
+        "end_date":   end_date,
+        "hourly":     "wind_speed_10m,wind_speed_100m,cloud_cover,temperature_2m",
+        "models":     "best_match",
+        "timezone":   "UTC",
+        "wind_speed_unit": "ms",
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=300)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log.error(f"Open-Meteo historical forecast fetch failed: {e}")
+        return 0
+
+    hourly = data.get("hourly", {})
+    if not hourly.get("time"):
+        log.error("No hourly data in response")
+        return 0
+
+    df = pd.DataFrame({
+        "timestamp":        pd.to_datetime(hourly["time"], utc=True),
+        "fcst_wind_100m":   hourly.get("wind_speed_100m", [None]*len(hourly["time"])),
+        "fcst_wind_10m":    hourly.get("wind_speed_10m",  [None]*len(hourly["time"])),
+        "fcst_cloud_cover": hourly.get("cloud_cover",     [None]*len(hourly["time"])),
+        "fcst_temperature": hourly.get("temperature_2m",  [None]*len(hourly["time"])),
+    })
+
+    conn = get_conn()
+    conn.execute("""
+        INSERT OR IGNORE INTO weather_forecast
+        SELECT * FROM df
+    """)
+    n = conn.execute("SELECT COUNT(*) FROM weather_forecast").fetchone()[0]
+    conn.close()
+
+    log.info(f"weather_forecast table now has {n:,} rows")
+    return len(df)
+
+
 def sync_all(api_key=None) -> dict:
     from entsoe import EntsoePandasClient
     key = api_key or ENTSOE_API_KEY
@@ -460,6 +531,11 @@ def sync_all(api_key=None) -> dict:
         conn.unregister("_smhi")
         conn.close()
         log.info(f"SMHI: stored {len(df_smhi)} forecast rows")
+
+    # Incremental forecast update – fetch last 16 days to stay current
+    yesterday = (pd.Timestamp.utcnow() - pd.Timedelta(days=16)).strftime("%Y-%m-%d")
+    today = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    backfill_openmeteo_forecasts(start_date=yesterday, end_date=today)
 
     gen         = sync_generation(client, start, end)
     nuclear_gen = sync_nuclear(client, start, end)
