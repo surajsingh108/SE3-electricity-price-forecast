@@ -176,19 +176,29 @@ def fetch_history(from_date: str, to_date: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_weather_range(from_date: str, to_date: str) -> pd.DataFrame:
-    """Load weather and SMHI wind forecast for the date range."""
+    """Load weather and forecast data for the date range."""
     try:
         conn = duckdb.connect(DB_PATH, read_only=True)
-        df_w = conn.execute("""
-            SELECT w.timestamp,
-                   w.windspeed_100m,
-                   w.temperature,
-                   s.smhi_wind_speed_ms
+        tables = conn.execute("SHOW TABLES").df()["name"].tolist()
+        has_fcst = "weather_forecast" in tables
+
+        query = """
+            SELECT
+                w.timestamp,
+                w.windspeed_100m,
+                w.temperature,
+                {} as fcst_wind_100m
             FROM weather w
-            LEFT JOIN smhi_wind_forecast s ON w.timestamp = s.timestamp
+            {}
             WHERE w.timestamp >= ? AND w.timestamp <= ?
             ORDER BY w.timestamp
-        """, [from_date, to_date]).df()
+        """.format(
+            "wf.fcst_wind_100m" if has_fcst else "NULL",
+            "LEFT JOIN weather_forecast wf ON w.timestamp = wf.timestamp"
+            if has_fcst else ""
+        )
+
+        df_w = conn.execute(query, [from_date, to_date]).df()
         conn.close()
         if df_w.empty:
             return pd.DataFrame()
@@ -388,7 +398,7 @@ elif page == "📉 Backtesting":
 
     overlay = st.multiselect(
         "Overlay on chart",
-        ["Wind speed (100m)", "SMHI Wind Forecast",
+        ["Wind speed (100m)", "Wind Forecast (Open-Meteo)",
          "Forecast error (actual – p50)", "Temperature"],
         default=[]
     )
@@ -424,7 +434,7 @@ elif page == "📉 Backtesting":
     from plotly.subplots import make_subplots
 
     needs_secondary = any(o in overlay for o in [
-        "Wind speed (100m)", "SMHI Wind Forecast", "Temperature"
+        "Wind speed (100m)", "Wind Forecast (Open-Meteo)", "Temperature"
     ])
 
     fig = make_subplots(specs=[[{"secondary_y": needs_secondary}]])
@@ -478,13 +488,13 @@ elif page == "📉 Backtesting":
                           width=1.5, dash="dot")),
                 secondary_y=True)
 
-    # SMHI wind forecast
-    if "SMHI Wind Forecast" in overlay and not df_weather.empty:
-        if "smhi_wind_speed_ms" in df_weather.columns:
+    # Wind forecast (Open-Meteo)
+    if "Wind Forecast (Open-Meteo)" in overlay and not df_weather.empty:
+        if "fcst_wind_100m" in df_weather.columns:
             fig.add_trace(go.Scatter(
                 x=df_weather.index,
-                y=df_weather["smhi_wind_speed_ms"],
-                name="SMHI Wind Forecast (m/s)",
+                y=df_weather["fcst_wind_100m"],
+                name="Wind Forecast (Open-Meteo, m/s)",
                 line=dict(color="rgba(52,211,153,0.9)",
                           width=1.5, dash="dash")),
                 secondary_y=True)
