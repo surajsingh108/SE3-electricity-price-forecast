@@ -13,6 +13,7 @@ data/
 model/
 *.pkl
 metrics.json
+notebooks/
 
 # ── Weather API cache ─────────────────────────────────────────────────────────
 .weather_cache/
