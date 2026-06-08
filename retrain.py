@@ -45,4 +45,14 @@ if __name__ == "__main__":
     log.info("Step 3: generating imbalance + spike forecast...")
     run([sys.executable, "ml_imbalance.py", "--forecast"])
 
+    log.info("Step 4: backfilling hindcast (last 7 days)...")
+    result = subprocess.run(
+        [sys.executable, "hindcast_imbalance.py", "--last-days", "7"],
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode == 0:
+        log.info("Hindcast complete: %s", result.stdout.strip()[-200:])
+    else:
+        log.warning("Hindcast failed (non-fatal): %s", result.stderr[-500:])
+
     log.info("Forecast refresh complete.")

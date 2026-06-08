@@ -451,7 +451,7 @@ def chart_layout(fig, title: str = "", y_label: str = "EUR/MWh",
         paper_bgcolor="white",
         plot_bgcolor="#fafbfc",
         font=dict(family="JetBrains Mono, monospace", size=11, color="#636e72"),
-        title=title_cfg,
+        title=title_cfg if title_cfg is not None else dict(text=""),
         xaxis=dict(
             gridcolor="#edf0f4", gridwidth=0.5,
             linecolor="#e0e4ea", linewidth=1,
@@ -1194,7 +1194,7 @@ elif page == "📉 Backtesting":
         with col1:
             imbl_from = st.date_input(
                 "From",
-                value=date.today() - timedelta(days=30),
+                value=date.today() - timedelta(days=7),
                 min_value=date(2021, 11, 1),
                 max_value=date.today() - timedelta(days=1),
                 key="imbl_from",
@@ -1207,6 +1207,10 @@ elif page == "📉 Backtesting":
                 max_value=date.today(),
                 key="imbl_to",
             )
+        st.caption(
+            "Hindcast forecasts available from 2026-06-01 onwards. "
+            "For earlier dates only actuals are shown."
+        )
 
         with st.spinner("Loading imbalance data..."):
             df_act = fetch_imbalance_backtest_actuals(imbl_from, imbl_to)
@@ -1313,18 +1317,61 @@ elif page == "📉 Backtesting":
                 f"above 800 EUR/MWh not shown."
             )
         else:
-            # Actuals-only fallback
-            fig_main = go.Figure(go.Scatter(
+            # Actuals-only fallback: show when no forecast data overlaps the range
+            try:
+                _conn_tmp = duckdb.connect(DB_PATH, read_only=True)
+                _earliest = _conn_tmp.execute(
+                    "SELECT MIN(DATE(generated_at)) FROM imbalance_forecasts"
+                ).fetchone()[0]
+                _conn_tmp.close()
+                _earliest_str = str(_earliest) if _earliest else "unknown"
+            except Exception:
+                _earliest_str = "2026-06-01"
+
+            st.caption(
+                f"No forecast data for this period — showing actuals only. "
+                f"Hindcast available from {_earliest_str} onwards."
+            )
+            fig_main = go.Figure()
+            fig_main.add_trace(go.Scatter(
                 x=df_act.index, y=df_act["imbl_price"].clip(-300, 800),
                 name="Actual price", line=dict(color=ACTUAL, width=1.2),
             ))
-            chart_layout(fig_main, y_label="Imbalance price (EUR/MWh)", height=380)
+            chart_layout(fig_main, y_label="Imbalance price (EUR/MWh)", height=300)
             st.plotly_chart(fig_main, use_container_width=True)
-            st.info(
-                "No overlapping forecast data found for this period. "
-                "Forecasts are only available from when the model was "
-                "first deployed. Showing actuals only."
-            )
+
+            # Show price + direction stats even without forecast
+            section_label("Price distribution")
+            _col_s1, _col_s2 = st.columns(2)
+            with _col_s1:
+                _pv = df_act["imbl_price"].dropna()
+                _ps = pd.DataFrame({
+                    "Metric": ["Mean", "Median", "Std dev", "% negative", "% stress (>200)"],
+                    "Value": [
+                        f"{_pv.mean():.1f} EUR/MWh",
+                        f"{_pv.median():.1f} EUR/MWh",
+                        f"{_pv.std():.1f} EUR/MWh",
+                        f"{(_pv < 0).mean()*100:.1f}%",
+                        f"{(_pv > 200).mean()*100:.1f}%",
+                    ],
+                })
+                st.dataframe(_ps, use_container_width=True, hide_index=True)
+            with _col_s2:
+                _dc = df_act["direction"].value_counts()
+                _td = len(df_act)
+                _fd = go.Figure(go.Bar(
+                    x=[int(_dc.get(-1, 0)), int(_dc.get(0, 0)), int(_dc.get(1, 0))],
+                    y=["Long", "Neutral", "Short"],
+                    orientation="h",
+                    marker_color=[FORECAST, "#e0e4ea", DANGER],
+                    text=[f"{_dc.get(-1,0)/_td*100:.1f}%",
+                          f"{_dc.get(0,0)/_td*100:.1f}%",
+                          f"{_dc.get(1,0)/_td*100:.1f}%"],
+                    textposition="auto",
+                ))
+                chart_layout(_fd, y_label="", height=180)
+                _fd.update_layout(margin=dict(l=60, r=20, t=10, b=10))
+                st.plotly_chart(_fd, use_container_width=True)
 
         # ── Three sub-charts ──────────────────────────────────────────────────
         if has_enough:
