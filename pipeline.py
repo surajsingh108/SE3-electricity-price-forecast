@@ -96,6 +96,27 @@ def _create_tables(conn):
             fcst_cloud_cover DOUBLE,
             fcst_temperature DOUBLE
         )""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS imbalance_prices (
+            timestamp      TIMESTAMPTZ PRIMARY KEY,
+            imbl_price     DOUBLE,
+            direction      INTEGER,
+            reg_spread     DOUBLE,
+            imbl_spot_diff DOUBLE,
+            up_reg_price   DOUBLE,
+            down_reg_price DOUBLE
+        )""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS imbalance_forecasts (
+            timestamp    TIMESTAMPTZ,
+            generated_at TIMESTAMPTZ,
+            p05          DOUBLE,
+            p50          DOUBLE,
+            p95          DOUBLE,
+            spike_proba  DOUBLE,
+            regime       VARCHAR,
+            PRIMARY KEY (timestamp, generated_at)
+        )""")
 
 
 def _cached_max(conn, table, border=None):
@@ -431,6 +452,119 @@ def sync_flows(client, start, end):
     return flows.ffill(limit=3)
 
 
+def _gap_15min(conn, table: str, start: pd.Timestamp, end: pd.Timestamp):
+    """Like _gap() but for 15-min-resolution tables (adds 15min, not 1h)."""
+    r = conn.execute(f"SELECT MAX(timestamp), COUNT(*) FROM {table}").fetchone()
+    mx, n = r
+    if n:
+        mx = pd.Timestamp(mx).tz_convert("Europe/Stockholm")
+    if n == 0:
+        log.info("  %s: empty, fetching full range", table)
+        return start, end
+    if mx >= end:
+        log.info("  ✓ %s: fully cached (%d rows)", table, n)
+        return None
+    fs = mx + pd.Timedelta(minutes=15)
+    log.info("  ↻ %s: fetching %s → %s", table, fs.date(), end.date())
+    return fs, end
+
+
+def sync_imbalance(
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch SE3 imbalance prices from eSett Open Data and upsert to imbalance_prices.
+
+    Incremental — only fetches the tail beyond what's already cached.
+    Reuses fetch_imbalance() from notebooks/data_sources.py (2-month chunks).
+
+    Parameters
+    ----------
+    start : pd.Timestamp | None   Defaults to TRAIN_START.
+    end   : pd.Timestamp | None   Defaults to now (floor 15min).
+    """
+    from data_sources import fetch_imbalance  # noqa: PLC0415
+
+    if start is None:
+        start = pd.Timestamp(TRAIN_START, tz="Europe/Stockholm")
+    if end is None:
+        end = pd.Timestamp.now("Europe/Stockholm").floor("15min")
+
+    conn = get_conn()
+    gap  = _gap_15min(conn, "imbalance_prices", start, end)
+
+    if gap:
+        fs, fe = gap
+        log.info("Fetching eSett imbalance %s → %s...", fs.date(), fe.date())
+        try:
+            df_raw = fetch_imbalance(fs, fe)
+        except Exception as exc:
+            log.warning("eSett fetch failed: %s", exc)
+            conn.close()
+            return pd.DataFrame()
+
+        if df_raw.empty:
+            log.warning("eSett returned empty DataFrame.")
+            conn.close()
+            return pd.DataFrame()
+
+        # Compute reg_spread from constituent columns
+        if "up_reg_price" in df_raw.columns and "down_reg_price" in df_raw.columns:
+            df_raw["reg_spread"] = (
+                pd.to_numeric(df_raw["up_reg_price"], errors="coerce")
+                - pd.to_numeric(df_raw["down_reg_price"], errors="coerce")
+            )
+        else:
+            df_raw["reg_spread"] = np.nan
+
+        # Align to the table schema
+        keep = [
+            "imbl_price", "direction", "reg_spread",
+            "imbl_spot_diff", "up_reg_price", "down_reg_price",
+        ]
+        for col in keep:
+            if col not in df_raw.columns:
+                df_raw[col] = np.nan
+        df_raw = df_raw[keep].reset_index()   # brings 'timestamp' back as column
+        df_raw["direction"] = pd.to_numeric(df_raw["direction"], errors="coerce").fillna(0).astype(int)
+
+        _upsert(conn, "imbalance_prices", df_raw)
+
+    df = conn.execute(
+        "SELECT * FROM imbalance_prices ORDER BY timestamp"
+    ).df()
+    conn.close()
+
+    if not df.empty:
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_convert("Europe/Stockholm")
+        df = df.set_index("timestamp")
+    return df
+
+
+def save_imbalance_forecast(forecast_df: pd.DataFrame) -> None:
+    """
+    Persist an imbalance+spike combined forecast to the imbalance_forecasts table.
+
+    Parameters
+    ----------
+    forecast_df : pd.DataFrame
+        Columns: timestamp, p05, p50, p95, spike_proba, regime.
+    """
+    conn = get_conn()
+    now  = pd.Timestamp.now("UTC")
+    df   = forecast_df.copy()
+    if "timestamp" not in df.columns:
+        df = df.reset_index().rename(columns={"index": "timestamp"})
+    df["generated_at"] = now
+    cols = ["timestamp", "generated_at", "p05", "p50", "p95", "spike_proba", "regime"]
+    for col in cols:
+        if col not in df.columns:
+            df[col] = np.nan
+    _upsert(conn, "imbalance_forecasts", df[cols])
+    conn.close()
+
+
 def save_forecast(forecast_df: pd.DataFrame) -> None:
     conn = get_conn()
     now = pd.Timestamp.now("UTC")
@@ -505,7 +639,7 @@ def backfill_openmeteo_forecasts(
     return len(df)
 
 
-def sync_all(api_key=None) -> dict:
+def sync_all(api_key=None, retrain_imbalance: bool = False) -> dict:
     from entsoe import EntsoePandasClient
     key = api_key or ENTSOE_API_KEY
     client = EntsoePandasClient(api_key=key)
@@ -540,36 +674,80 @@ def sync_all(api_key=None) -> dict:
     gen         = sync_generation(client, start, end)
     nuclear_gen = sync_nuclear(client, start, end)
     flows_df    = sync_flows(client, start, end)
-    log.info("Sync complete — prices:%d weather:%d gen:%d",
-             len(prices), len(weather), len(gen))
-    return {"prices": prices, "weather": weather, "gen": gen,
-            "nuclear_gen": nuclear_gen, "flows_df": flows_df,
-            "start": start, "end": end}
+
+    # Imbalance prices (eSett, 15-min resolution)
+    log.info("Syncing imbalance prices...")
+    try:
+        imbalance = sync_imbalance(start, pd.Timestamp.now("Europe/Stockholm").floor("15min"))
+    except Exception as exc:
+        log.warning("sync_imbalance failed: %s", exc)
+        imbalance = pd.DataFrame()
+
+    log.info(
+        "Sync complete — prices:%d weather:%d gen:%d imbalance:%d",
+        len(prices), len(weather), len(gen), len(imbalance),
+    )
+
+    if retrain_imbalance:
+        log.info("--retrain-imbalance flag set; training imbalance + spike models...")
+        try:
+            import ml_imbalance as _mli  # noqa: PLC0415
+            _data = {"merged_df": None}   # ml_imbalance will load from DB
+            art_i = _mli.train_imbalance(_data)
+            _mli.save_imbalance_artifacts(art_i)
+            art_s = _mli.train_spike(_data)
+            _mli.save_spike_artifacts(art_s)
+            log.info(
+                "Imbalance models retrained — MAE=%.2f  AUC=%.3f",
+                art_i["metrics"]["mae"], art_s["metrics"]["auc_roc"],
+            )
+        except Exception as exc:
+            log.warning("Imbalance retrain failed: %s", exc)
+
+    return {
+        "prices":     prices,
+        "weather":    weather,
+        "gen":        gen,
+        "nuclear_gen": nuclear_gen,
+        "flows_df":   flows_df,
+        "imbalance":  imbalance,
+        "start":      start,
+        "end":        end,
+    }
 
 
 def cache_status() -> dict:
     conn = get_conn()
     status = {}
-    for t in ["prices", "weather", "generation", "nuclear_gen", "forecasts"]:
-        r = conn.execute(
-            f"SELECT MIN(timestamp), MAX(timestamp), COUNT(*) FROM {t}").fetchone()
-        mn, mx, n = r
-        status[t] = {"rows": n,
-                     "from": str(pd.Timestamp(mn).date()) if n else None,
-                     "to":   str(pd.Timestamp(mx).date()) if n else None}
+    tables = ["prices", "weather", "generation", "nuclear_gen", "forecasts", "imbalance_prices"]
+    for t in tables:
+        try:
+            r = conn.execute(
+                f"SELECT MIN(timestamp), MAX(timestamp), COUNT(*) FROM {t}"
+            ).fetchone()
+            mn, mx, n = r
+            status[t] = {
+                "rows": n,
+                "from": str(pd.Timestamp(mn).date()) if n else None,
+                "to":   str(pd.Timestamp(mx).date()) if n else None,
+            }
+        except Exception:
+            status[t] = {"rows": 0, "from": None, "to": None}
     conn.close()
     return status
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--status", action="store_true")
-    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--status",            action="store_true")
+    parser.add_argument("--api-key",           default=None)
+    parser.add_argument("--retrain-imbalance", action="store_true",
+                        help="Retrain imbalance + spike models after sync")
     args = parser.parse_args()
     if args.status:
         import json
         print(json.dumps(cache_status(), indent=2))
     else:
-        sync_all(args.api_key)
+        sync_all(args.api_key, retrain_imbalance=args.retrain_imbalance)
         import json
         print(json.dumps(cache_status(), indent=2))

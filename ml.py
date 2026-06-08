@@ -72,6 +72,10 @@ NEUTRALIZE_FEATS = [
     "fcst_temperature",
     "fcst_wind_surprise",
     "fcst_cloud_surprise",
+    # Imbalance features (all lagged ≥24h — safe for day-ahead spot price model)
+    "imbl_price_lag24",
+    "imbl_roll_24h_mean",
+    "imbl_roll_24h_std",
 ]
 
 LGBM_PARAMS = {
@@ -312,6 +316,23 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         drop.append("nuclear_gen_mw")
     X = X.drop(columns=[c for c in drop if c in X.columns])
 
+    # ── Imbalance features (all lagged ≥24h to avoid day-ahead leakage) ──────
+    # Guard: only if imbalance data was joined before calling build_features.
+    # LightGBM handles NaN natively — missing imbalance data does not fail.
+    if "imbl_price" in X.columns and X["imbl_price"].notna().any():
+        p_imbl = X["imbl_price"]
+        X["imbl_price_lag24"]      = p_imbl.shift(24)
+        X["imbl_price_lag168"]     = p_imbl.shift(168)
+        X["imbl_roll_24h_mean"]    = p_imbl.shift(24).rolling(24).mean()
+        X["imbl_roll_24h_std"]     = p_imbl.shift(24).rolling(24).std()
+        if "direction" in X.columns:
+            X["imbl_direction_lag24"] = X["direction"].shift(24)
+        X["imbl_spike_flag_lag24"] = (p_imbl.abs() > 200).astype(int).shift(24)
+        if "up_reg_price" in X.columns and "down_reg_price" in X.columns:
+            X["imbl_spread_lag24"] = (
+                X["up_reg_price"] - X["down_reg_price"]
+            ).shift(24)
+
     return X
 
 
@@ -357,7 +378,17 @@ def make_feature_cols(df: pd.DataFrame) -> list[str]:
                  if ("flow_" in c and ("lag24" in c or "lag168" in c))
                  or c in ["net_pos_lag24", "net_pos_roll7d", "se4_x_peak"]]
 
-    all_f = price_f + cal_f + weather_f + gen_f + nuclear_f + flow_f
+    imbl_f = [
+        c for c in [
+            "imbl_price_lag24", "imbl_price_lag168",
+            "imbl_roll_24h_mean", "imbl_roll_24h_std",
+            "imbl_direction_lag24", "imbl_spike_flag_lag24",
+            "imbl_spread_lag24",
+        ]
+        if c in df.columns and df[c].notna().any()
+    ]
+
+    all_f = price_f + cal_f + weather_f + gen_f + nuclear_f + flow_f + imbl_f
     seen  = set()
     result = []
     for c in all_f:
@@ -463,6 +494,23 @@ def train(data: dict) -> dict:
         df["nuclear_gen_mw"] = nuclear_gen.reindex(df.index).ffill(limit=3)
     if not flows_df.empty:
         df = df.join(flows_df.reindex(df.index).ffill(limit=3))
+
+    # Join imbalance data (15-min → hourly resample) for spot price improvement
+    imbalance = data.get("imbalance", pd.DataFrame())
+    if not imbalance.empty:
+        imbl = imbalance.copy()
+        if "timestamp" in imbl.columns:
+            imbl = imbl.set_index("timestamp")
+        imbl.index = pd.to_datetime(imbl.index)
+        if imbl.index.tz is None:
+            imbl.index = imbl.index.tz_localize("Europe/Stockholm")
+        else:
+            imbl.index = imbl.index.tz_convert("Europe/Stockholm")
+        imbl_h = imbl[
+            [c for c in ["imbl_price", "direction", "up_reg_price", "down_reg_price"]
+             if c in imbl.columns]
+        ].resample("h").mean()
+        df = df.join(imbl_h.reindex(df.index), how="left")
 
     for col in ["wind_gen_mw", "load_mw"]:
         if col in df.columns:

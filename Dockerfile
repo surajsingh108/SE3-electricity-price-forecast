@@ -14,7 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && find /root/.local/lib -path "*/streamlit/static*" -name "*.map" \
        -delete 2>/dev/null; true
 
-COPY pipeline.py ml.py dashboard.py api.py ./
+COPY pipeline.py ml.py ml_imbalance.py dashboard.py api.py retrain.py retrain_imbalance.py ./
+COPY data_sources.py feature_engineering.py ./
 COPY agent ./agent
 
 RUN mkdir -p /app/data /app/model
