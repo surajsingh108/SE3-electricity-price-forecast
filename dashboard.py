@@ -1634,6 +1634,147 @@ elif page == "💬 Ask SE3":
         if st.button("Why is the price high?"):
             st.session_state.se3_question = "Why is the SE3 electricity price high right now?"
 
+    with st.expander("🤖 Model Self-Diagnosis Log", expanded=False):
+        st.markdown(
+            '<div style="font-size:13px;color:#747d8c;margin-bottom:1rem;">'
+            "Automated threshold adjustments and model health checks"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        @st.cache_data(ttl=300, show_spinner=False)
+        def fetch_threshold_decisions(limit: int = 20) -> pd.DataFrame | None:
+            try:
+                conn = duckdb.connect(DB_PATH, read_only=True)
+                df = conn.execute(f"""
+                    SELECT timestamp, current_threshold,
+                           recommended_threshold, action,
+                           decision, reasoning, confidence,
+                           recall, precision_val, f2, applied
+                    FROM threshold_decisions
+                    ORDER BY timestamp DESC
+                    LIMIT {limit}
+                """).df()
+                conn.close()
+                if df.empty:
+                    return None
+                df["timestamp"] = pd.to_datetime(
+                    df["timestamp"], utc=True
+                ).dt.tz_convert("Europe/Stockholm")
+                return df
+            except Exception:
+                return None
+
+        decisions = fetch_threshold_decisions()
+
+        if decisions is None or decisions.empty:
+            st.caption(
+                "No diagnosis runs yet. "
+                "Run: python diagnose_threshold.py"
+            )
+        else:
+            latest = decisions.iloc[0]
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                kpi_card(
+                    "Current threshold",
+                    f"{latest['current_threshold']:.3f}",
+                    "spike detector",
+                )
+            with c2:
+                last_action = latest["action"]
+                accent = (
+                    "#00d4aa" if last_action == "no_change" else
+                    "#ffa502" if last_action in ["increase", "decrease"] else
+                    "#ff4757"
+                )
+                kpi_card(
+                    "Last action",
+                    last_action.replace("_", " ").title(),
+                    latest["timestamp"].strftime("%d %b %H:%M"),
+                    accent=accent,
+                )
+            with c3:
+                f2_val     = latest["f2"]
+                recall_val = latest["recall"]
+                kpi_card(
+                    "Last F2",
+                    f"{f2_val:.3f}" if pd.notna(f2_val) and f2_val else "—",
+                    f"recall={recall_val:.2f}" if pd.notna(recall_val) and recall_val else "",
+                )
+
+            st.markdown(
+                '<hr style="border:none;border-top:1px solid #e8ecf0;margin:1rem 0">',
+                unsafe_allow_html=True,
+            )
+
+            section_label("Decision history")
+            for _, row in decisions.iterrows():
+                ts_str   = row["timestamp"].strftime("%d %b %H:%M")
+                decision = row["decision"]
+                action   = row["action"]
+
+                if decision == "applied" and action != "no_change":
+                    icon  = "🔄"
+                    color = "#ffa502"
+                elif decision in ["no_change", "applied"]:
+                    icon  = "✓"
+                    color = "#00d4aa"
+                elif decision == "rejected":
+                    icon  = "✗"
+                    color = "#ff4757"
+                elif decision == "dry_run":
+                    icon  = "👁"
+                    color = "#3742fa"
+                else:
+                    icon  = "·"
+                    color = "#747d8c"
+
+                curr = row["current_threshold"]
+                rec  = row["recommended_threshold"]
+                thresh_str = (
+                    f"{curr:.3f} → {rec:.3f}"
+                    if abs(rec - curr) > 0.005
+                    else f"{curr:.3f} (unchanged)"
+                )
+
+                f2_str     = f"{row['f2']:.3f}"     if pd.notna(row["f2"])     else "—"
+                recall_str = f"{row['recall']:.2f}" if pd.notna(row["recall"]) else "—"
+                reasoning  = row["reasoning"] or "—"
+                confidence = row["confidence"] or "—"
+
+                st.markdown(f"""
+                <div style="display:flex;gap:12px;align-items:flex-start;
+                            padding:8px 0;border-bottom:0.5px solid #f2f4f7;">
+                    <div style="font-size:16px;flex-shrink:0">{icon}</div>
+                    <div style="flex:1">
+                        <div style="display:flex;justify-content:space-between;
+                                    align-items:center;margin-bottom:3px">
+                            <span style="font-family:'JetBrains Mono',monospace;
+                                         font-size:12px;font-weight:500;
+                                         color:{color}">{thresh_str}</span>
+                            <span style="font-size:10px;color:#a0aab4">{ts_str}</span>
+                        </div>
+                        <div style="font-size:11px;color:#636e72;line-height:1.4">
+                            {reasoning}
+                        </div>
+                        <div style="display:flex;gap:8px;margin-top:4px">
+                            <span style="font-size:9px;color:#a0aab4">
+                                F2={f2_str}
+                            </span>
+                            <span style="font-size:9px;color:#a0aab4">
+                                recall={recall_str}
+                            </span>
+                            <span style="font-size:9px;color:#a0aab4;
+                                         text-transform:uppercase;
+                                         letter-spacing:0.5px">
+                                {decision} · {confidence}
+                            </span>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
     with st.form(key="ask_form"):
         question  = st.text_input("Or type your own question:",
                                   value=st.session_state.se3_question)

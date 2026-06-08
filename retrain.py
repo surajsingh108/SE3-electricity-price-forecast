@@ -55,4 +55,17 @@ if __name__ == "__main__":
     else:
         log.warning("Hindcast failed (non-fatal): %s", result.stderr[-500:])
 
+    log.info("Running threshold diagnosis...")
+    result = subprocess.run(
+        [sys.executable, "diagnose_threshold.py", "--days", "30"],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode == 0:
+        log.info("Threshold diagnosis complete: %s",
+                 result.stdout.strip()[-200:])
+    else:
+        log.warning("Threshold diagnosis failed: %s",
+                    result.stderr[-300:])
+        # Never block the main pipeline on diagnosis failure
+
     log.info("Forecast refresh complete.")
