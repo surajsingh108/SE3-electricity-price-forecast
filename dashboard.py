@@ -355,7 +355,7 @@ def fetch_imbalance_backtest_actuals(from_date: date, to_date: date) -> pd.DataF
             SELECT timestamp, imbl_price, direction, reg_spread
             FROM imbalance_prices
             WHERE timestamp >= ?
-              AND timestamp <  ? + INTERVAL 1 DAY
+              AND timestamp <  CAST(? AS DATE) + INTERVAL 1 DAY
             ORDER BY timestamp
         """, [str(from_date), str(to_date)]).df()
         conn.close()
@@ -391,7 +391,7 @@ def fetch_imbalance_backtest_forecasts(from_date: date, to_date: date) -> pd.Dat
                        spike_proba, regime, generated_at
                 FROM imbalance_forecasts
                 WHERE timestamp >= ?
-                  AND timestamp <  ? + INTERVAL 1 DAY
+                  AND timestamp <  CAST(? AS DATE) + INTERVAL 1 DAY
                 ORDER BY timestamp
             """, [str(from_date), str(to_date)]).df()
         else:
@@ -409,7 +409,7 @@ def fetch_imbalance_backtest_forecasts(from_date: date, to_date: date) -> pd.Dat
                   ON f.timestamp    = best.timestamp
                  AND f.generated_at = best.best_gen
                 WHERE f.timestamp >= ?
-                  AND f.timestamp <  ? + INTERVAL 1 DAY
+                  AND f.timestamp <  CAST(? AS DATE) + INTERVAL 1 DAY
                 ORDER BY f.timestamp
             """, [str(from_date), str(to_date)]).df()
 
