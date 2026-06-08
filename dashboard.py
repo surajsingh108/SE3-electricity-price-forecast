@@ -18,6 +18,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pytz
@@ -343,6 +344,85 @@ def fetch_imbalance_forecast() -> pd.DataFrame:
     except Exception as e:
         st.warning(f"Could not load imbalance forecast: {e}")
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_imbalance_backtest_actuals(from_date: date, to_date: date) -> pd.DataFrame | None:
+    """Load imbalance_prices for a date range (used in backtesting tab)."""
+    try:
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        df = conn.execute("""
+            SELECT timestamp, imbl_price, direction, reg_spread
+            FROM imbalance_prices
+            WHERE timestamp >= ?
+              AND timestamp <  ? + INTERVAL 1 DAY
+            ORDER BY timestamp
+        """, [str(from_date), str(to_date)]).df()
+        conn.close()
+        if df.empty:
+            return None
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"], utc=True
+        ).dt.tz_convert("Europe/Stockholm")
+        return df.set_index("timestamp")
+    except Exception as e:
+        st.warning(f"Could not load imbalance actuals: {e}")
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_imbalance_backtest_forecasts(from_date: date, to_date: date) -> pd.DataFrame | None:
+    """
+    Load historical imbalance forecasts using an as-of join.
+
+    For each actual timestamp, returns the forecast from the most recent
+    generated_at that is at or before that timestamp — i.e. what the model
+    predicted at the time, not with hindsight.
+    """
+    try:
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        n_runs = conn.execute(
+            "SELECT COUNT(DISTINCT generated_at) FROM imbalance_forecasts"
+        ).fetchone()[0]
+
+        if n_runs <= 1:
+            df = conn.execute("""
+                SELECT timestamp, p05, p50, p95,
+                       spike_proba, regime, generated_at
+                FROM imbalance_forecasts
+                WHERE timestamp >= ?
+                  AND timestamp <  ? + INTERVAL 1 DAY
+                ORDER BY timestamp
+            """, [str(from_date), str(to_date)]).df()
+        else:
+            df = conn.execute("""
+                SELECT f.timestamp, f.p05, f.p50, f.p95,
+                       f.spike_proba, f.regime, f.generated_at
+                FROM imbalance_forecasts f
+                INNER JOIN (
+                    SELECT timestamp,
+                           MAX(generated_at) AS best_gen
+                    FROM imbalance_forecasts
+                    WHERE generated_at <= timestamp
+                    GROUP BY timestamp
+                ) best
+                  ON f.timestamp    = best.timestamp
+                 AND f.generated_at = best.best_gen
+                WHERE f.timestamp >= ?
+                  AND f.timestamp <  ? + INTERVAL 1 DAY
+                ORDER BY f.timestamp
+            """, [str(from_date), str(to_date)]).df()
+
+        conn.close()
+        if df.empty:
+            return None
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"], utc=True
+        ).dt.tz_convert("Europe/Stockholm")
+        return df.set_index("timestamp")
+    except Exception as e:
+        st.warning(f"Could not load imbalance forecasts: {e}")
+        return None
 
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
@@ -961,148 +1041,413 @@ elif page == "📉 Backtesting":
     page_header("Analysis", "Backtesting",
                 "Compare actual prices against historical forecasts")
 
-    col1, col2 = st.columns(2)
-    with col1: from_date = st.date_input("From", value=date.today() - timedelta(days=14))
-    with col2: to_date   = st.date_input("To",   value=date.today())
-    if from_date >= to_date:
-        st.error("From date must be before To date.")
-        st.stop()
+    tab1, tab2 = st.tabs(["📈 Spot Price", "⚡ Imbalance Price"])
 
-    overlay = st.multiselect(
-        "Overlay on chart",
-        ["Wind speed (100m)", "Wind Forecast (Open-Meteo)",
-         "Forecast error (actual – p50)", "Temperature"],
-        default=[],
-    )
+    # ── Tab 1: Spot Price (existing code, unchanged) ──────────────────────────
+    with tab1:
+        col1, col2 = st.columns(2)
+        with col1: from_date = st.date_input("From", value=date.today() - timedelta(days=14))
+        with col2: to_date   = st.date_input("To",   value=date.today())
+        if from_date >= to_date:
+            st.error("From date must be before To date.")
+            st.stop()
 
-    with st.spinner("Loading history..."):
-        df         = fetch_history(str(from_date), str(to_date))
-        df_weather = fetch_weather_range(str(from_date), str(to_date))
-
-    if df.empty:
-        st.info("No data for this range.")
-        st.stop()
-
-    has_fc = df["p50"].notna()
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        kpi_card("Hours", f"{len(df):,}", f"{from_date} → {to_date}")
-    with c2:
-        kpi_card("Hours with forecast", f"{has_fc.sum():,}",
-                 f"{100*has_fc.mean():.0f}% coverage")
-    with c3:
-        mae = df.loc[has_fc, "abs_error"].mean() if has_fc.any() else None
-        _acc = PRIMARY if (mae or 99) < 20 else WARNING
-        kpi_card("MAE", f"{mae:.2f}" if mae else "—", "EUR/MWh", accent=_acc)
-    with c4:
-        if has_fc.any():
-            cov = (
-                (df.loc[has_fc, "actual"] >= df.loc[has_fc, "p05"]) &
-                (df.loc[has_fc, "actual"] <= df.loc[has_fc, "p95"])
-            ).mean() * 100
-            _acc = PRIMARY if cov >= 85 else WARNING
-            kpi_card("PI Coverage", f"{cov:.1f}%", "q5–q95", accent=_acc)
-        else:
-            kpi_card("PI Coverage", "—", "no forecast data")
-
-    _divider()
-
-    from plotly.subplots import make_subplots
-
-    needs_secondary = any(o in overlay for o in [
-        "Wind speed (100m)", "Wind Forecast (Open-Meteo)", "Temperature"
-    ])
-    fig = make_subplots(specs=[[{"secondary_y": needs_secondary}]])
-
-    if has_fc.any():
-        fc_df = df[has_fc]
-        fig.add_trace(go.Scatter(
-            x=list(fc_df.index) + list(fc_df.index[::-1]),
-            y=list(fc_df["p95"]) + list(fc_df["p05"][::-1]),
-            fill="toself", fillcolor="rgba(55,66,250,0.08)",
-            line=dict(color="rgba(0,0,0,0)"),
-            name="90% band"),
-            secondary_y=False)
-        fig.add_trace(go.Scatter(
-            x=fc_df.index, y=fc_df["p50"],
-            name="Forecast (median)",
-            line=dict(color=FORECAST, width=1.8)),
-            secondary_y=False)
-
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["actual"],
-        name="Actual",
-        line=dict(color=ACTUAL, width=1.5)),
-        secondary_y=False)
-
-    if "Forecast error (actual – p50)" in overlay and has_fc.any():
-        errors = fc_df["actual"] - fc_df["p50"]
-        fig.add_trace(go.Bar(
-            x=fc_df.index, y=errors,
-            name="Error (actual – p50)",
-            marker_color=[
-                "rgba(255,71,87,0.5)" if v > 0 else "rgba(55,66,250,0.5)"
-                for v in errors
-            ],
-            opacity=0.6),
-            secondary_y=False)
-
-    if "Wind speed (100m)" in overlay and not df_weather.empty:
-        if "windspeed_100m" in df_weather.columns:
-            fig.add_trace(go.Scatter(
-                x=df_weather.index, y=df_weather["windspeed_100m"],
-                name="Wind speed 100m (m/s)",
-                line=dict(color="rgba(0,212,170,0.9)", width=1.5, dash="dot")),
-                secondary_y=True)
-
-    if "Wind Forecast (Open-Meteo)" in overlay and not df_weather.empty:
-        if "fcst_wind_100m" in df_weather.columns:
-            fig.add_trace(go.Scatter(
-                x=df_weather.index, y=df_weather["fcst_wind_100m"],
-                name="Wind Forecast (Open-Meteo, m/s)",
-                line=dict(color="rgba(0,212,170,0.65)", width=1.5, dash="dash")),
-                secondary_y=True)
-
-    if "Temperature" in overlay and not df_weather.empty:
-        if "temperature" in df_weather.columns:
-            fig.add_trace(go.Scatter(
-                x=df_weather.index, y=df_weather["temperature"],
-                name="Temperature (°C)",
-                line=dict(color="rgba(255,165,2,0.9)", width=1.5, dash="dot")),
-                secondary_y=True)
-
-    chart_layout(fig, "Actual vs Forecast", y_label="Price (EUR/MWh)",
-                 height=420, show_title=True)
-    if needs_secondary:
-        fig.update_yaxes(
-            title_text="Wind (m/s) / Temp (°C)",
-            secondary_y=True,
-            showgrid=False,
+        overlay = st.multiselect(
+            "Overlay on chart",
+            ["Wind speed (100m)", "Wind Forecast (Open-Meteo)",
+             "Forecast error (actual – p50)", "Temperature"],
+            default=[],
         )
-    st.plotly_chart(fig, use_container_width=True)
 
-    if has_fc.any():
-        col_l, col_r = st.columns(2)
-        with col_l:
-            section_label("Daily MAE trend")
-            daily_mae = df.loc[has_fc, "abs_error"].resample("D").mean().dropna()
-            fig2 = go.Figure(go.Scatter(
-                x=daily_mae.index, y=daily_mae.values,
+        with st.spinner("Loading history..."):
+            df         = fetch_history(str(from_date), str(to_date))
+            df_weather = fetch_weather_range(str(from_date), str(to_date))
+
+        if df.empty:
+            st.info("No data for this range.")
+            st.stop()
+
+        has_fc = df["p50"].notna()
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            kpi_card("Hours", f"{len(df):,}", f"{from_date} → {to_date}")
+        with c2:
+            kpi_card("Hours with forecast", f"{has_fc.sum():,}",
+                     f"{100*has_fc.mean():.0f}% coverage")
+        with c3:
+            mae = df.loc[has_fc, "abs_error"].mean() if has_fc.any() else None
+            _acc = PRIMARY if (mae or 99) < 20 else WARNING
+            kpi_card("MAE", f"{mae:.2f}" if mae else "—", "EUR/MWh", accent=_acc)
+        with c4:
+            if has_fc.any():
+                cov = (
+                    (df.loc[has_fc, "actual"] >= df.loc[has_fc, "p05"]) &
+                    (df.loc[has_fc, "actual"] <= df.loc[has_fc, "p95"])
+                ).mean() * 100
+                _acc = PRIMARY if cov >= 85 else WARNING
+                kpi_card("PI Coverage", f"{cov:.1f}%", "q5–q95", accent=_acc)
+            else:
+                kpi_card("PI Coverage", "—", "no forecast data")
+
+        _divider()
+
+        from plotly.subplots import make_subplots
+
+        needs_secondary = any(o in overlay for o in [
+            "Wind speed (100m)", "Wind Forecast (Open-Meteo)", "Temperature"
+        ])
+        fig = make_subplots(specs=[[{"secondary_y": needs_secondary}]])
+
+        if has_fc.any():
+            fc_df = df[has_fc]
+            fig.add_trace(go.Scatter(
+                x=list(fc_df.index) + list(fc_df.index[::-1]),
+                y=list(fc_df["p95"]) + list(fc_df["p05"][::-1]),
                 fill="toself", fillcolor="rgba(55,66,250,0.08)",
-                line=dict(color=FORECAST, width=1.5)))
-            chart_layout(fig2, y_label="MAE (EUR/MWh)", height=280)
-            st.plotly_chart(fig2, use_container_width=True)
+                line=dict(color="rgba(0,0,0,0)"),
+                name="90% band"),
+                secondary_y=False)
+            fig.add_trace(go.Scatter(
+                x=fc_df.index, y=fc_df["p50"],
+                name="Forecast (median)",
+                line=dict(color=FORECAST, width=1.8)),
+                secondary_y=False)
 
-        with col_r:
-            section_label("Error distribution")
-            errors = df.loc[has_fc, "error"].dropna()
-            fig3 = go.Figure(go.Histogram(
-                x=errors, nbinsx=40,
-                marker=dict(color=FORECAST, opacity=0.7)))
-            fig3.add_vline(x=0, line_color=DANGER, line_dash="dash")
-            chart_layout(fig3, y_label="Count", height=280)
-            fig3.update_layout(xaxis_title="Error (EUR/MWh)", showlegend=False)
-            st.plotly_chart(fig3, use_container_width=True)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["actual"],
+            name="Actual",
+            line=dict(color=ACTUAL, width=1.5)),
+            secondary_y=False)
+
+        if "Forecast error (actual – p50)" in overlay and has_fc.any():
+            errors = fc_df["actual"] - fc_df["p50"]
+            fig.add_trace(go.Bar(
+                x=fc_df.index, y=errors,
+                name="Error (actual – p50)",
+                marker_color=[
+                    "rgba(255,71,87,0.5)" if v > 0 else "rgba(55,66,250,0.5)"
+                    for v in errors
+                ],
+                opacity=0.6),
+                secondary_y=False)
+
+        if "Wind speed (100m)" in overlay and not df_weather.empty:
+            if "windspeed_100m" in df_weather.columns:
+                fig.add_trace(go.Scatter(
+                    x=df_weather.index, y=df_weather["windspeed_100m"],
+                    name="Wind speed 100m (m/s)",
+                    line=dict(color="rgba(0,212,170,0.9)", width=1.5, dash="dot")),
+                    secondary_y=True)
+
+        if "Wind Forecast (Open-Meteo)" in overlay and not df_weather.empty:
+            if "fcst_wind_100m" in df_weather.columns:
+                fig.add_trace(go.Scatter(
+                    x=df_weather.index, y=df_weather["fcst_wind_100m"],
+                    name="Wind Forecast (Open-Meteo, m/s)",
+                    line=dict(color="rgba(0,212,170,0.65)", width=1.5, dash="dash")),
+                    secondary_y=True)
+
+        if "Temperature" in overlay and not df_weather.empty:
+            if "temperature" in df_weather.columns:
+                fig.add_trace(go.Scatter(
+                    x=df_weather.index, y=df_weather["temperature"],
+                    name="Temperature (°C)",
+                    line=dict(color="rgba(255,165,2,0.9)", width=1.5, dash="dot")),
+                    secondary_y=True)
+
+        chart_layout(fig, "Actual vs Forecast", y_label="Price (EUR/MWh)",
+                     height=420, show_title=True)
+        if needs_secondary:
+            fig.update_yaxes(
+                title_text="Wind (m/s) / Temp (°C)",
+                secondary_y=True,
+                showgrid=False,
+            )
+        st.plotly_chart(fig, use_container_width=True)
+
+        if has_fc.any():
+            col_l, col_r = st.columns(2)
+            with col_l:
+                section_label("Daily MAE trend")
+                daily_mae = df.loc[has_fc, "abs_error"].resample("D").mean().dropna()
+                fig2 = go.Figure(go.Scatter(
+                    x=daily_mae.index, y=daily_mae.values,
+                    fill="toself", fillcolor="rgba(55,66,250,0.08)",
+                    line=dict(color=FORECAST, width=1.5)))
+                chart_layout(fig2, y_label="MAE (EUR/MWh)", height=280)
+                st.plotly_chart(fig2, use_container_width=True)
+
+            with col_r:
+                section_label("Error distribution")
+                errors = df.loc[has_fc, "error"].dropna()
+                fig3 = go.Figure(go.Histogram(
+                    x=errors, nbinsx=40,
+                    marker=dict(color=FORECAST, opacity=0.7)))
+                fig3.add_vline(x=0, line_color=DANGER, line_dash="dash")
+                chart_layout(fig3, y_label="Count", height=280)
+                fig3.update_layout(xaxis_title="Error (EUR/MWh)", showlegend=False)
+                st.plotly_chart(fig3, use_container_width=True)
+
+    # ── Tab 2: Imbalance Price Backtesting ────────────────────────────────────
+    with tab2:
+        col1, col2 = st.columns(2)
+        with col1:
+            imbl_from = st.date_input(
+                "From",
+                value=date.today() - timedelta(days=30),
+                min_value=date(2021, 11, 1),
+                max_value=date.today() - timedelta(days=1),
+                key="imbl_from",
+            )
+        with col2:
+            imbl_to = st.date_input(
+                "To",
+                value=date.today() - timedelta(days=1),
+                min_value=date(2021, 11, 1),
+                max_value=date.today(),
+                key="imbl_to",
+            )
+
+        with st.spinner("Loading imbalance data..."):
+            df_act = fetch_imbalance_backtest_actuals(imbl_from, imbl_to)
+            df_fc  = fetch_imbalance_backtest_forecasts(imbl_from, imbl_to)
+
+        if df_act is None or df_act.empty:
+            st.info("No imbalance data found for this date range.")
+            st.caption("Data available from November 2021 onwards.")
+            st.stop()
+
+        # Merge actuals with forecasts
+        has_fc_imbl = df_fc is not None and not df_fc.empty
+        if has_fc_imbl:
+            df_merged   = df_act.join(
+                df_fc[["p05", "p50", "p95", "spike_proba", "regime"]],
+                how="left",
+            )
+            df_with_fc  = df_merged.dropna(subset=["p50"])
+        else:
+            df_merged  = df_act.copy()
+            df_with_fc = pd.DataFrame()
+
+        n_periods  = len(df_act)
+        n_days     = (imbl_to - imbl_from).days + 1
+        has_enough = len(df_with_fc) > 10
+
+        # Compute metrics
+        if has_enough:
+            y_true = df_with_fc["imbl_price"]
+            y_pred = df_with_fc["p50"]
+            i_mae  = (y_true - y_pred).abs().mean()
+            i_rmse = float(((y_true - y_pred) ** 2).mean() ** 0.5)
+            dir_correct = (
+                (y_pred.diff().apply(np.sign) == y_true.diff().apply(np.sign))
+                .dropna().mean() * 100
+            )
+            in_band  = (y_true >= df_with_fc["p05"]) & (y_true <= df_with_fc["p95"])
+            coverage = in_band.mean() * 100
+            actual_spikes = y_true > 200
+            if actual_spikes.sum() > 0 and "spike_proba" in df_with_fc.columns:
+                spike_recall = float(
+                    (df_with_fc["spike_proba"] > 0.45)[actual_spikes].mean() * 100
+                )
+            else:
+                spike_recall = None
+        else:
+            i_mae = i_rmse = dir_correct = coverage = spike_recall = None
+
+        # ── KPI cards ─────────────────────────────────────────────────────────
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            kpi_card("Periods", f"{n_periods:,}", f"{n_days} days · 15-min")
+        with c2:
+            _acc = FORECAST if i_mae and i_mae < 35 else WARNING
+            kpi_card("Forecast MAE",
+                     f"{i_mae:.1f}" if i_mae else "—",
+                     "EUR/MWh · p50 vs actual", accent=_acc)
+        with c3:
+            _acc = PRIMARY if dir_correct and dir_correct > 60 else WARNING
+            kpi_card("Direction accuracy",
+                     f"{dir_correct:.1f}%" if dir_correct else "—",
+                     "p50 move direction", accent=_acc)
+        with c4:
+            _acc = PRIMARY if coverage and coverage >= 85 else WARNING
+            kpi_card("PI coverage",
+                     f"{coverage:.1f}%" if coverage else "—",
+                     "p05–p95 · target 90%", accent=_acc)
+        with c5:
+            _d = spike_recall is not None and spike_recall < 25
+            _acc = PRIMARY if spike_recall and spike_recall > 40 else DANGER
+            kpi_card("Spike recall",
+                     f"{spike_recall:.0f}%" if spike_recall is not None else "—",
+                     "spikes caught @ 0.45 thr",
+                     accent=_acc, danger=_d)
+
+        # ── Main chart: Actual vs Forecast ────────────────────────────────────
+        section_label(f"Actual vs Forecast — {imbl_from} to {imbl_to}")
+
+        if has_enough:
+            fig_main = go.Figure()
+            fig_main.add_trace(go.Scatter(
+                x=df_with_fc.index.tolist() + df_with_fc.index.tolist()[::-1],
+                y=df_with_fc["p95"].tolist() + df_with_fc["p05"].tolist()[::-1],
+                fill="toself",
+                fillcolor="rgba(0,212,170,0.10)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="p05–p95 band",
+            ))
+            fig_main.add_trace(go.Scatter(
+                x=df_with_fc.index, y=df_with_fc["p50"],
+                name="Forecast p50",
+                line=dict(color=PRIMARY, width=1.5, dash="dash"),
+            ))
+            fig_main.add_trace(go.Scatter(
+                x=df_act.index, y=df_act["imbl_price"].clip(-300, 800),
+                name="Actual price",
+                line=dict(color=ACTUAL, width=1.2),
+            ))
+            chart_layout(fig_main, y_label="Imbalance price (EUR/MWh)", height=380)
+            st.plotly_chart(fig_main, use_container_width=True)
+            st.caption(
+                f"Prices clipped to [−300, 800] EUR/MWh for readability. "
+                f"{int((df_act['imbl_price'] > 800).sum())} extreme spikes "
+                f"above 800 EUR/MWh not shown."
+            )
+        else:
+            # Actuals-only fallback
+            fig_main = go.Figure(go.Scatter(
+                x=df_act.index, y=df_act["imbl_price"].clip(-300, 800),
+                name="Actual price", line=dict(color=ACTUAL, width=1.2),
+            ))
+            chart_layout(fig_main, y_label="Imbalance price (EUR/MWh)", height=380)
+            st.plotly_chart(fig_main, use_container_width=True)
+            st.info(
+                "No overlapping forecast data found for this period. "
+                "Forecasts are only available from when the model was "
+                "first deployed. Showing actuals only."
+            )
+
+        # ── Three sub-charts ──────────────────────────────────────────────────
+        if has_enough:
+            col_a, col_b, col_c = st.columns(3)
+
+            with col_a:
+                section_label("Residuals (actual − p50)")
+                residuals = (df_with_fc["imbl_price"] - df_with_fc["p50"]).clip(-300, 300)
+                fig_r = go.Figure()
+                fig_r.add_trace(go.Bar(
+                    x=df_with_fc.index,
+                    y=residuals,
+                    marker_color=[DANGER if v > 0 else FORECAST for v in residuals],
+                    showlegend=False,
+                ))
+                fig_r.add_hline(y=0, line_color="#e0e4ea", line_width=1)
+                chart_layout(fig_r, y_label="EUR/MWh", height=220)
+                st.plotly_chart(fig_r, use_container_width=True)
+
+            with col_b:
+                section_label("Spike probability vs actuals")
+                fig_s = go.Figure()
+                if "spike_proba" in df_with_fc.columns:
+                    fig_s.add_trace(go.Scatter(
+                        x=df_with_fc.index,
+                        y=df_with_fc["spike_proba"],
+                        name="Spike probability",
+                        line=dict(color=WARNING, width=1.2),
+                        fill="tozeroy",
+                        fillcolor="rgba(255,165,2,0.12)",
+                    ))
+                    actual_spikes_mask = df_with_fc["imbl_price"] > 200
+                    if actual_spikes_mask.any():
+                        fig_s.add_trace(go.Scatter(
+                            x=df_with_fc.index[actual_spikes_mask],
+                            y=[1.0] * int(actual_spikes_mask.sum()),
+                            mode="markers",
+                            marker=dict(symbol="triangle-down", size=8, color=DANGER),
+                            name="Actual spike (>200)",
+                        ))
+                    fig_s.add_hline(
+                        y=0.45, line_dash="dash",
+                        line_color=DANGER, line_width=1,
+                        annotation_text="dispatch thr",
+                        annotation_font_size=9,
+                    )
+                chart_layout(fig_s, y_label="Probability", height=220)
+                fig_s.update_yaxes(range=[0, 1.1])
+                st.plotly_chart(fig_s, use_container_width=True)
+
+            with col_c:
+                section_label("MAE by hour of day")
+                hourly_mae = (
+                    (df_with_fc["imbl_price"] - df_with_fc["p50"])
+                    .abs()
+                    .groupby(df_with_fc.index.hour)
+                    .mean()
+                )
+                fig_h = go.Figure(go.Bar(
+                    x=hourly_mae.index,
+                    y=hourly_mae.values,
+                    marker_color=[
+                        DANGER   if h in [7, 8, 9, 17, 18, 19, 20] else
+                        FORECAST if h in [0, 1, 2, 3, 4, 5, 23] else
+                        "#e0e4ea"
+                        for h in hourly_mae.index
+                    ],
+                    showlegend=False,
+                ))
+                chart_layout(fig_h, y_label="MAE (EUR/MWh)", height=220)
+                st.plotly_chart(fig_h, use_container_width=True)
+
+        # ── Summary stats ─────────────────────────────────────────────────────
+        if has_enough or not df_act.empty:
+            section_label("Summary statistics")
+            col_x, col_y = st.columns(2)
+
+            with col_x:
+                section_label("Direction distribution")
+                dir_counts = df_act["direction"].value_counts()
+                total_dir  = len(df_act)
+                dir_stats  = {
+                    "Long (−1)":   int(dir_counts.get(-1, 0)),
+                    "Neutral (0)": int(dir_counts.get(0,  0)),
+                    "Short (+1)":  int(dir_counts.get(1,  0)),
+                }
+                fig_d = go.Figure(go.Bar(
+                    x=list(dir_stats.values()),
+                    y=list(dir_stats.keys()),
+                    orientation="h",
+                    marker_color=[FORECAST, "#e0e4ea", DANGER],
+                    text=[f"{v / total_dir * 100:.1f}%" for v in dir_stats.values()],
+                    textposition="auto",
+                ))
+                chart_layout(fig_d, y_label="", height=180)
+                fig_d.update_layout(margin=dict(l=80, r=20, t=10, b=10))
+                st.plotly_chart(fig_d, use_container_width=True)
+
+            with col_y:
+                section_label("Price distribution")
+                price_valid = df_act["imbl_price"].dropna()
+                price_stats = pd.DataFrame({
+                    "Metric": [
+                        "Mean", "Median", "Std dev",
+                        "Min", "Max",
+                        "% negative", "% stress (>200)",
+                        "% extreme (>1000)",
+                    ],
+                    "Value": [
+                        f"{price_valid.mean():.1f} EUR/MWh",
+                        f"{price_valid.median():.1f} EUR/MWh",
+                        f"{price_valid.std():.1f} EUR/MWh",
+                        f"{price_valid.min():.1f} EUR/MWh",
+                        f"{price_valid.max():.1f} EUR/MWh",
+                        f"{(price_valid < 0).mean() * 100:.1f}%",
+                        f"{(price_valid > 200).mean() * 100:.1f}%",
+                        f"{(price_valid > 1000).mean() * 100:.2f}%",
+                    ],
+                })
+                st.dataframe(price_stats,
+                             use_container_width=True,
+                             hide_index=True,
+                             height=280)
 
 
 # ── Page: Data ────────────────────────────────────────────────────────────────
