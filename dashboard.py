@@ -1208,8 +1208,10 @@ elif page == "📉 Backtesting":
                 key="imbl_to",
             )
         st.caption(
-            "Hindcast forecasts available from 2026-06-01 onwards. "
-            "For earlier dates only actuals are shown."
+            "Each day's hindcast forecasts the following day. "
+            "Selecting Jun 1–7 shows forecast evaluation for Jun 2–7 "
+            "(Jun 1 is the first hindcast date — no prior forecast exists for it). "
+            "Hindcast available from 2026-06-01 onwards."
         )
 
         with st.spinner("Loading imbalance data..."):
@@ -1237,22 +1239,23 @@ elif page == "📉 Backtesting":
         n_days     = (imbl_to - imbl_from).days + 1
         has_enough = len(df_with_fc) > 10
 
-        # Compute metrics
+        # Compute metrics (drop NaN rows to avoid nan results)
         if has_enough:
-            y_true = df_with_fc["imbl_price"]
-            y_pred = df_with_fc["p50"]
-            i_mae  = (y_true - y_pred).abs().mean()
-            i_rmse = float(((y_true - y_pred) ** 2).mean() ** 0.5)
+            _valid = df_with_fc.dropna(subset=["imbl_price", "p50"])
+            y_true = _valid["imbl_price"]
+            y_pred = _valid["p50"]
+            i_mae  = float((y_true - y_pred).abs().mean()) if len(_valid) > 0 else None
+            i_rmse = float(((y_true - y_pred) ** 2).mean() ** 0.5) if len(_valid) > 0 else None
             dir_correct = (
                 (y_pred.diff().apply(np.sign) == y_true.diff().apply(np.sign))
                 .dropna().mean() * 100
-            )
-            in_band  = (y_true >= df_with_fc["p05"]) & (y_true <= df_with_fc["p95"])
-            coverage = in_band.mean() * 100
+            ) if len(_valid) > 1 else None
+            in_band  = (y_true >= _valid["p05"]) & (y_true <= _valid["p95"])
+            coverage = float(in_band.mean() * 100) if len(_valid) > 0 else None
             actual_spikes = y_true > 200
-            if actual_spikes.sum() > 0 and "spike_proba" in df_with_fc.columns:
+            if actual_spikes.sum() > 0 and "spike_proba" in _valid.columns:
                 spike_recall = float(
-                    (df_with_fc["spike_proba"] > 0.45)[actual_spikes].mean() * 100
+                    (_valid["spike_proba"] > 0.45)[actual_spikes].mean() * 100
                 )
             else:
                 spike_recall = None
@@ -1360,13 +1363,13 @@ elif page == "📉 Backtesting":
                 _dc = df_act["direction"].value_counts()
                 _td = len(df_act)
                 _fd = go.Figure(go.Bar(
-                    x=[int(_dc.get(-1, 0)), int(_dc.get(0, 0)), int(_dc.get(1, 0))],
-                    y=["Long", "Neutral", "Short"],
+                    x=[int(_dc.get(1, 0)), int(_dc.get(0, 0)), int(_dc.get(-1, 0))],
+                    y=["Short (+1)", "Neutral (0)", "Long (−1)"],
                     orientation="h",
-                    marker_color=[FORECAST, "#e0e4ea", DANGER],
-                    text=[f"{_dc.get(-1,0)/_td*100:.1f}%",
+                    marker_color=[DANGER, "#e0e4ea", FORECAST],
+                    text=[f"{_dc.get(1,0)/_td*100:.1f}%",
                           f"{_dc.get(0,0)/_td*100:.1f}%",
-                          f"{_dc.get(1,0)/_td*100:.1f}%"],
+                          f"{_dc.get(-1,0)/_td*100:.1f}%"],
                     textposition="auto",
                 ))
                 chart_layout(_fd, y_label="", height=180)
@@ -1453,17 +1456,17 @@ elif page == "📉 Backtesting":
                 section_label("Direction distribution")
                 dir_counts = df_act["direction"].value_counts()
                 total_dir  = len(df_act)
-                dir_stats  = {
-                    "Long (−1)":   int(dir_counts.get(-1, 0)),
-                    "Neutral (0)": int(dir_counts.get(0,  0)),
-                    "Short (+1)":  int(dir_counts.get(1,  0)),
-                }
+                # Plotly horizontal bars render first item at bottom → put Long last to appear at top
+                _d_vals  = [int(dir_counts.get(1,  0)), int(dir_counts.get(0,  0)), int(dir_counts.get(-1, 0))]
+                _d_lbls  = ["Short (+1)", "Neutral (0)", "Long (−1)"]
+                _d_clrs  = [DANGER, "#e0e4ea", FORECAST]
+                _d_texts = [f"{v / total_dir * 100:.1f}%" for v in _d_vals]
                 fig_d = go.Figure(go.Bar(
-                    x=list(dir_stats.values()),
-                    y=list(dir_stats.keys()),
+                    x=_d_vals,
+                    y=_d_lbls,
                     orientation="h",
-                    marker_color=[FORECAST, "#e0e4ea", DANGER],
-                    text=[f"{v / total_dir * 100:.1f}%" for v in dir_stats.values()],
+                    marker_color=_d_clrs,
+                    text=_d_texts,
                     textposition="auto",
                 ))
                 chart_layout(fig_d, y_label="", height=180)
