@@ -569,8 +569,65 @@ with st.sidebar:
     )
 
     if st.button("↺  Refresh", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+        with st.spinner("Refreshing forecasts..."):
+            try:
+                import requests as _req
+                api_url = os.environ.get("API_URL", "http://localhost:8000")
+                resp = _req.post(f"{api_url}/retrain", timeout=300)
+                if resp.status_code == 200:
+                    st.cache_data.clear()
+                    st.success("Forecasts refreshed successfully")
+                    st.rerun()
+                else:
+                    st.warning(f"Refresh returned {resp.status_code} — "
+                               f"clearing cache only")
+                    st.cache_data.clear()
+                    st.rerun()
+            except Exception as e:
+                st.warning(f"Could not reach API ({e}) — "
+                           f"clearing cache only")
+                st.cache_data.clear()
+                st.rerun()
+
+    @st.cache_data(ttl=60, show_spinner=False)
+    def fetch_forecast_age():
+        try:
+            conn = duckdb.connect(DB_PATH, read_only=True)
+            spot_gen = conn.execute(
+                "SELECT MAX(generated_at) FROM forecasts"
+            ).fetchone()[0]
+            imbl_gen = conn.execute(
+                "SELECT MAX(generated_at) FROM imbalance_forecasts"
+            ).fetchone()[0]
+            conn.close()
+            return spot_gen, imbl_gen
+        except Exception:
+            return None, None
+
+    spot_gen, imbl_gen = fetch_forecast_age()
+    if spot_gen:
+        now_tz  = pd.Timestamp.now(tz="Europe/Stockholm")
+        spot_ts = pd.Timestamp(spot_gen).tz_convert("Europe/Stockholm")
+        age_min = int((now_tz - spot_ts).total_seconds() / 60)
+        if age_min < 60:
+            age_str = f"{age_min}min ago"
+        elif age_min < 1440:
+            age_str = f"{age_min // 60}h ago"
+        else:
+            age_str = f"{age_min // 1440}d ago"
+
+        color = (
+            "#00d4aa" if age_min < 180  else
+            "#ffa502" if age_min < 720  else
+            "#ff4757"
+        )
+        st.markdown(f"""
+        <div style="font-size:10px;color:{color};
+                    font-family:'JetBrains Mono',monospace;
+                    margin-top:4px;padding:0 4px">
+            ↺ forecast {age_str}
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("""
     <div style="margin-top:1rem;">

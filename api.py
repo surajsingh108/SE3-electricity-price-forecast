@@ -177,21 +177,66 @@ async def health():
 
 @app.post("/retrain")
 async def retrain():
-    """Trigger model retraining."""
-    import subprocess, sys
+    """Run the full forecast refresh pipeline (no model retraining)."""
+    import subprocess
+    import sys
+    import time
+
+    t0             = time.time()
+    steps_done: list[str] = []
+    logs: list[str]       = []
+
+    def _run(label: str, cmd: list[str], timeout: int = 300) -> bool:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            logs.append(f"[{label}] exit={r.returncode} {r.stdout[-300:].strip()}")
+            if r.returncode == 0:
+                steps_done.append(label)
+                return True
+            logs.append(f"[{label}] stderr={r.stderr[-200:].strip()}")
+            return False
+        except subprocess.TimeoutExpired:
+            logs.append(f"[{label}] TIMEOUT after {timeout}s")
+            return False
+        except Exception as exc:
+            logs.append(f"[{label}] ERROR {exc}")
+            return False
+
+    _run("pipeline", [sys.executable, "pipeline.py"], timeout=300)
+    _run("spot_forecast", [sys.executable, "ml.py", "--forecast"], timeout=120)
+    _run("imbalance_forecast", [sys.executable, "ml_imbalance.py", "--forecast"], timeout=120)
+    _run("hindcast", [sys.executable, "hindcast_imbalance.py", "--last-days", "7"], timeout=300)
+    _run("threshold_diagnosis", [sys.executable, "diagnose_threshold.py", "--days", "30"], timeout=120)
+
+    # Fetch latest generated_at for each forecast table
     try:
-        result = subprocess.run(
-            [sys.executable, "retrain.py"],
-            capture_output=True, text=True, timeout=1800
-        )
-        if result.returncode == 0:
-            return {"status": "success", "log": result.stdout[-2000:]}
-        else:
-            return {"status": "error", "log": result.stderr[-2000:]}
-    except subprocess.TimeoutExpired:
-        return {"status": "timeout", "log": "Training exceeded 30 minutes"}
-    except Exception as e:
-        return {"status": "error", "log": str(e)}
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        spot_gen = conn.execute(
+            "SELECT MAX(generated_at) FROM forecasts"
+        ).fetchone()[0]
+        imbl_gen = conn.execute(
+            "SELECT MAX(generated_at) FROM imbalance_forecasts"
+        ).fetchone()[0]
+        thr_rec = conn.execute(
+            "SELECT decision, action, recommended_threshold "
+            "FROM threshold_decisions ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+    except Exception:
+        spot_gen = imbl_gen = thr_rec = None
+
+    return {
+        "status":                          "ok" if steps_done else "error",
+        "steps_completed":                 steps_done,
+        "spot_forecast_generated_at":      str(spot_gen) if spot_gen else None,
+        "imbalance_forecast_generated_at": str(imbl_gen) if imbl_gen else None,
+        "threshold_decision":              (
+            f"{thr_rec[1]} → {thr_rec[2]:.4f} ({thr_rec[0]})"
+            if thr_rec else None
+        ),
+        "duration_seconds":                round(time.time() - t0, 1),
+        "log":                             "\n".join(logs[-20:]),
+    }
 
 
 if __name__ == "__main__":
