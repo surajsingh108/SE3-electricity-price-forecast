@@ -347,79 +347,77 @@ def fetch_imbalance_forecast() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_imbalance_backtest_actuals(from_date: date, to_date: date) -> pd.DataFrame | None:
-    """Load imbalance_prices for a date range (used in backtesting tab)."""
+def fetch_imbalance_backtest_actuals(from_date, to_date):
+    """
+    Returns actuals for [from_date, to_date+1day) as a DataFrame
+    indexed by timestamp in Europe/Stockholm.
+    Columns: imbl_price, direction, reg_spread
+    """
     try:
         conn = duckdb.connect(DB_PATH, read_only=True)
+        # Fetch all rows in window — let pandas handle the join later
         df = conn.execute("""
             SELECT timestamp, imbl_price, direction, reg_spread
             FROM imbalance_prices
-            WHERE timestamp >= ?
-              AND timestamp <  CAST(? AS DATE) + INTERVAL 1 DAY
+            WHERE CAST(timestamp AS DATE) >= CAST(? AS DATE)
+              AND CAST(timestamp AS DATE) <  CAST(? AS DATE) + INTERVAL 1 DAY
             ORDER BY timestamp
         """, [str(from_date), str(to_date)]).df()
         conn.close()
         if df.empty:
             return None
-        df["timestamp"] = pd.to_datetime(
-            df["timestamp"], utc=True
-        ).dt.tz_convert("Europe/Stockholm")
-        return df.set_index("timestamp")
+        # Normalize timezone to Europe/Stockholm
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)\
+                            .dt.tz_convert("Europe/Stockholm")
+        df = df.set_index("timestamp")
+        return df
     except Exception as e:
         st.warning(f"Could not load imbalance actuals: {e}")
         return None
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_imbalance_backtest_forecasts(from_date: date, to_date: date) -> pd.DataFrame | None:
+def fetch_imbalance_backtest_forecasts(from_date, to_date):
     """
-    Load historical imbalance forecasts using an as-of join.
+    Returns forecasts whose TIMESTAMP falls in [from_date, to_date+1day).
+    Filter is on timestamp (the period the forecast is for),
+    NOT on generated_at (when the forecast was made).
 
-    For each actual timestamp, returns the forecast from the most recent
-    generated_at that is at or before that timestamp — i.e. what the model
-    predicted at the time, not with hindsight.
+    When multiple forecasts exist for the same timestamp
+    (e.g. overlapping hindcasts), keep the one with the
+    largest generated_at <= timestamp — i.e. the most recent
+    forecast that was made BEFORE that period actually happened.
+    Done in pandas, not SQL, so it's transparent.
     """
     try:
         conn = duckdb.connect(DB_PATH, read_only=True)
-        n_runs = conn.execute(
-            "SELECT COUNT(DISTINCT generated_at) FROM imbalance_forecasts"
-        ).fetchone()[0]
-
-        if n_runs <= 1:
-            df = conn.execute("""
-                SELECT timestamp, p05, p50, p95,
-                       spike_proba, regime, generated_at
-                FROM imbalance_forecasts
-                WHERE timestamp >= ?
-                  AND timestamp <  CAST(? AS DATE) + INTERVAL 1 DAY
-                ORDER BY timestamp
-            """, [str(from_date), str(to_date)]).df()
-        else:
-            df = conn.execute("""
-                SELECT f.timestamp, f.p05, f.p50, f.p95,
-                       f.spike_proba, f.regime, f.generated_at
-                FROM imbalance_forecasts f
-                INNER JOIN (
-                    SELECT timestamp,
-                           MAX(generated_at) AS best_gen
-                    FROM imbalance_forecasts
-                    WHERE generated_at <= timestamp
-                    GROUP BY timestamp
-                ) best
-                  ON f.timestamp    = best.timestamp
-                 AND f.generated_at = best.best_gen
-                WHERE f.timestamp >= ?
-                  AND f.timestamp <  CAST(? AS DATE) + INTERVAL 1 DAY
-                ORDER BY f.timestamp
-            """, [str(from_date), str(to_date)]).df()
-
+        df = conn.execute("""
+            SELECT timestamp, generated_at, p05, p50, p95,
+                   spike_proba, regime
+            FROM imbalance_forecasts
+            WHERE CAST(timestamp AS DATE) >= CAST(? AS DATE)
+              AND CAST(timestamp AS DATE) <  CAST(? AS DATE) + INTERVAL 1 DAY
+            ORDER BY timestamp, generated_at
+        """, [str(from_date), str(to_date)]).df()
         conn.close()
         if df.empty:
             return None
-        df["timestamp"] = pd.to_datetime(
-            df["timestamp"], utc=True
-        ).dt.tz_convert("Europe/Stockholm")
-        return df.set_index("timestamp")
+
+        # Normalize timezones to Europe/Stockholm
+        df["timestamp"]    = pd.to_datetime(df["timestamp"],    utc=True)\
+                              .dt.tz_convert("Europe/Stockholm")
+        df["generated_at"] = pd.to_datetime(df["generated_at"], utc=True)\
+                              .dt.tz_convert("Europe/Stockholm")
+
+        # As-of dedup: keep the most recent forecast made BEFORE
+        # the timestamp (no peeking into the future)
+        df = df[df["generated_at"] <= df["timestamp"]]
+        if df.empty:
+            return None
+        df = df.sort_values(["timestamp", "generated_at"])
+        df = df.drop_duplicates(subset=["timestamp"], keep="last")
+        df = df.set_index("timestamp")
+        return df
     except Exception as e:
         st.warning(f"Could not load imbalance forecasts: {e}")
         return None
@@ -1219,25 +1217,28 @@ elif page == "📉 Backtesting":
             df_fc  = fetch_imbalance_backtest_forecasts(imbl_from, imbl_to)
 
         if df_act is None or df_act.empty:
-            st.info("No imbalance data found for this date range.")
+            st.info("No imbalance data for this date range.")
             st.caption("Data available from November 2021 onwards.")
             st.stop()
 
-        # Merge actuals with forecasts
-        has_fc_imbl = df_fc is not None and not df_fc.empty
-        if has_fc_imbl:
-            df_merged   = df_act.join(
+        # Merge: actuals get forecast columns where timestamps match
+        if df_fc is not None and not df_fc.empty:
+            df_merged = df_act.join(
                 df_fc[["p05", "p50", "p95", "spike_proba", "regime"]],
-                how="left",
+                how="left"
             )
-            df_with_fc  = df_merged.dropna(subset=["p50"])
         else:
-            df_merged  = df_act.copy()
-            df_with_fc = pd.DataFrame()
+            df_merged = df_act.copy()
+            for c in ["p05", "p50", "p95", "spike_proba", "regime"]:
+                df_merged[c] = None
+
+        # Rows that have both actual and forecast
+        df_with_fc = df_merged.dropna(subset=["imbl_price", "p50"])
+
+        has_enough = len(df_with_fc) > 10
 
         n_periods  = len(df_act)
         n_days     = (imbl_to - imbl_from).days + 1
-        has_enough = len(df_with_fc) > 10
 
         # Compute metrics (drop NaN rows to avoid nan results)
         if has_enough:
