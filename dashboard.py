@@ -598,11 +598,16 @@ elif page == "⚡ Imbalance & Spike":
             age_min = int((pd.Timestamp.now(tz=tz) - last_valid_idx).total_seconds() / 60)
             age_str = (f"{age_min}min ago" if age_min < 60
                        else f"{age_min//60}h {age_min%60}min ago")
+            # eSett has a ~6-12h settlement lag; show context when data is stale
+            if age_min > 180:
+                sub_str = f"EUR/MWh · last settled {age_str} · eSett lag"
+            else:
+                sub_str = f"EUR/MWh · data from {age_str}"
             _d   = abs(cur_price) > 200
             _acc = WARNING if abs(cur_price) > 50 else PRIMARY
             kpi_card("Current imbalance price",
                      f"{cur_price:.1f}",
-                     f"EUR/MWh · data from {age_str}",
+                     sub_str,
                      accent=_acc, danger=_d)
         else:
             kpi_card("Current imbalance price", "—", "no recent data", accent=NEUTRAL)
@@ -681,10 +686,13 @@ elif page == "⚡ Imbalance & Spike":
             row=1, col=1,
         )
 
-        # Panel 1: Forecast (96 rows from most-recent run — show regardless of staleness)
+        # Panel 1: Show full forecast from its anchor point (covers the eSett lag gap).
+        # Filtering to >= now would create a visible gap between actuals end and forecast
+        # start, because the forecast is anchored to the last valid eSett row (~6-12h ago).
+        # The "now" vline already marks the present; showing past forecast lets users
+        # see both the gap period and the future prediction in one view.
         if has_forecast:
-            df_fc_future = df_fc[df_fc.index >= now]
-            df_fc24 = df_fc_future.head(96) if not df_fc_future.empty else df_fc.tail(48)
+            df_fc24 = df_fc.head(96)
 
             # Regime background shading
             if "regime" in df_fc24.columns and not df_fc24.empty:
